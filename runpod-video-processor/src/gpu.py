@@ -15,16 +15,18 @@ class GPUProfile:
     tile_size: int
     batch_size: int
     segment_size: int  # frames per chunked segment
+    rvm_batch_size: int = 8
+    rvm_downsample_ratio: float = 0.5
 
 
 # Profiles ordered by VRAM tier
 PROFILES = {
-    "A100-80GB": GPUProfile("A100-80GB", 80, 1024, 16, 2000),
-    "A100-40GB": GPUProfile("A100-40GB", 40, 768, 8, 1500),
-    "L40S-48GB": GPUProfile("L40S-48GB", 48, 768, 8, 1500),
-    "24GB":      GPUProfile("24GB", 24, 512, 4, 1000),
-    "16GB":      GPUProfile("16GB", 16, 384, 2, 500),
-    "fallback":  GPUProfile("fallback", 0, 256, 1, 300),
+    "A100-80GB": GPUProfile("A100-80GB", 80, 1024, 16, 2000, rvm_batch_size=16),
+    "A100-40GB": GPUProfile("A100-40GB", 40, 768, 8, 1500, rvm_batch_size=12),
+    "L40S-48GB": GPUProfile("L40S-48GB", 48, 768, 8, 1500, rvm_batch_size=12),
+    "24GB":      GPUProfile("24GB", 24, 512, 4, 1000, rvm_batch_size=8),
+    "16GB":      GPUProfile("16GB", 16, 384, 2, 500, rvm_batch_size=4, rvm_downsample_ratio=0.4),
+    "fallback":  GPUProfile("fallback", 0, 256, 1, 300, rvm_batch_size=2, rvm_downsample_ratio=0.25),
 }
 
 

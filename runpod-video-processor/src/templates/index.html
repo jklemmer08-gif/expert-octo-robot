@@ -111,32 +111,66 @@
 
             <!-- Job Configuration -->
             <div class="card p-4">
-                <h2 class="text-sm font-semibold text-slate-400 uppercase mb-3">Upscale Settings</h2>
+                <h2 class="text-sm font-semibold text-slate-400 uppercase mb-3">Settings</h2>
                 <div class="space-y-4">
                     <div>
                         <label class="block text-xs text-slate-400 mb-1">Selected File</label>
                         <div id="selected-file" class="text-sm font-mono truncate text-slate-500">None</div>
                         <input type="hidden" id="selected-path" value="">
                     </div>
+
+                    <!-- Pipeline Selector -->
                     <div>
-                        <label class="block text-xs text-slate-400 mb-1">Model</label>
-                        <select id="cfg-model" class="w-full rounded px-3 py-2 text-sm">
-                            <option value="RealESRGAN_x4plus">General (live action)</option>
-                            <option value="RealESRGAN_x4plus_anime_6B">Animation / anime</option>
-                            <option value="RealESRGAN_x2plus">2x upscale (general)</option>
+                        <label class="block text-xs text-slate-400 mb-1">Pipeline</label>
+                        <select id="cfg-pipeline" onchange="onPipelineChange()" class="w-full rounded px-3 py-2 text-sm">
+                            <option value="upscale">Upscale (Real-ESRGAN)</option>
+                            <option value="bgremove">Background Removal (RVM)</option>
                         </select>
                     </div>
-                    <div>
-                        <label class="block text-xs text-slate-400 mb-1">Scale</label>
-                        <select id="cfg-scale" class="w-full rounded px-3 py-2 text-sm">
-                            <option value="4">4x</option>
-                            <option value="2">2x</option>
-                        </select>
+
+                    <!-- Upscaler Settings -->
+                    <div id="upscale-settings">
+                        <div class="space-y-4">
+                            <div>
+                                <label class="block text-xs text-slate-400 mb-1">Model</label>
+                                <select id="cfg-model" class="w-full rounded px-3 py-2 text-sm">
+                                    <option value="RealESRGAN_x4plus">General (live action)</option>
+                                    <option value="RealESRGAN_x4plus_anime_6B">Animation / anime</option>
+                                    <option value="RealESRGAN_x2plus">2x upscale (general)</option>
+                                </select>
+                            </div>
+                            <div>
+                                <label class="block text-xs text-slate-400 mb-1">Scale</label>
+                                <select id="cfg-scale" class="w-full rounded px-3 py-2 text-sm">
+                                    <option value="4">4x</option>
+                                    <option value="2">2x</option>
+                                </select>
+                            </div>
+                            <div>
+                                <label class="block text-xs text-slate-400 mb-1">CRF (15=high quality, 28=small file)</label>
+                                <input type="number" id="cfg-crf-upscale" value="18" min="15" max="28" class="w-full rounded px-3 py-2 text-sm">
+                            </div>
+                        </div>
                     </div>
-                    <div>
-                        <label class="block text-xs text-slate-400 mb-1">CRF (15=high quality, 28=small file)</label>
-                        <input type="number" id="cfg-crf" value="18" min="15" max="28" class="w-full rounded px-3 py-2 text-sm">
+
+                    <!-- BG Removal Settings -->
+                    <div id="bgremove-settings" class="hidden">
+                        <div class="space-y-4">
+                            <div>
+                                <label class="block text-xs text-slate-400 mb-1">RVM Model</label>
+                                <select id="cfg-rvm-model" class="w-full rounded px-3 py-2 text-sm">
+                                    <option value="resnet50">ResNet50 (higher quality, slower)</option>
+                                    <option value="mobilenetv3">MobileNetV3 (faster, lighter)</option>
+                                </select>
+                            </div>
+                            <div>
+                                <label class="block text-xs text-slate-400 mb-1">VP9 CRF (20=high quality, 40=small file)</label>
+                                <input type="number" id="cfg-crf-bgremove" value="30" min="20" max="50" class="w-full rounded px-3 py-2 text-sm">
+                            </div>
+                        </div>
                     </div>
+
+                    <!-- Shared: VR Layout -->
                     <div>
                         <label class="block text-xs text-slate-400 mb-1">VR Layout</label>
                         <select id="cfg-layout" class="w-full rounded px-3 py-2 text-sm">
@@ -193,6 +227,30 @@
             ...opts,
         });
         return res.json();
+    }
+
+    // --- Pipeline Toggle ---
+    function onPipelineChange() {
+        const pipeline = document.getElementById('cfg-pipeline').value;
+        const upscaleDiv = document.getElementById('upscale-settings');
+        const bgremoveDiv = document.getElementById('bgremove-settings');
+
+        if (pipeline === 'bgremove') {
+            upscaleDiv.classList.add('hidden');
+            bgremoveDiv.classList.remove('hidden');
+        } else {
+            upscaleDiv.classList.remove('hidden');
+            bgremoveDiv.classList.add('hidden');
+        }
+
+        updateStartButton();
+    }
+
+    function updateStartButton() {
+        const btn = document.getElementById('btn-start');
+        if (!selectedFile || isProcessing) return;
+        const pipeline = document.getElementById('cfg-pipeline').value;
+        btn.textContent = pipeline === 'bgremove' ? 'Start BG Removal' : 'Start Upscaling';
     }
 
     // --- System Info ---
@@ -270,11 +328,12 @@
         document.getElementById('selected-file').classList.add('text-white');
         document.getElementById('selected-path').value = path;
         document.getElementById('btn-start').disabled = false;
-        document.getElementById('btn-start').textContent = 'Start Upscaling';
 
         if (layout && layout !== 'unknown' && layout !== '2d') {
             document.getElementById('cfg-layout').value = layout;
         }
+
+        updateStartButton();
     }
 
     // --- Start Job ---
@@ -286,24 +345,34 @@
         btn.textContent = 'Starting...';
         hideError();
 
+        const pipeline = document.getElementById('cfg-pipeline').value;
+        let body = {
+            input_path: selectedFile.path,
+            pipeline: pipeline,
+            layout: document.getElementById('cfg-layout').value,
+        };
+
+        if (pipeline === 'bgremove') {
+            body.rvm_model = document.getElementById('cfg-rvm-model').value;
+            body.crf = parseInt(document.getElementById('cfg-crf-bgremove').value);
+        } else {
+            body.model = document.getElementById('cfg-model').value;
+            body.scale = parseInt(document.getElementById('cfg-scale').value);
+            body.crf = parseInt(document.getElementById('cfg-crf-upscale').value);
+        }
+
         try {
             const res = await fetch('/api/process', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    input_path: selectedFile.path,
-                    model: document.getElementById('cfg-model').value,
-                    scale: parseInt(document.getElementById('cfg-scale').value),
-                    crf: parseInt(document.getElementById('cfg-crf').value),
-                    layout: document.getElementById('cfg-layout').value,
-                }),
+                body: JSON.stringify(body),
             });
 
             const data = await res.json();
             if (!res.ok) {
                 showError(data.errors ? data.errors.join('; ') : data.error || 'Unknown error');
                 btn.disabled = false;
-                btn.textContent = 'Start Upscaling';
+                updateStartButton();
                 return;
             }
 
@@ -314,7 +383,7 @@
         } catch (e) {
             showError('Failed to start job: ' + e.message);
             btn.disabled = false;
-            btn.textContent = 'Start Upscaling';
+            updateStartButton();
         }
     }
 
@@ -349,7 +418,7 @@
             document.getElementById('prog-bar').classList.add('bg-green-500');
             isProcessing = false;
             document.getElementById('btn-start').disabled = false;
-            document.getElementById('btn-start').textContent = 'Start Upscaling';
+            updateStartButton();
             loadOutputFiles();
             if (eventSource) eventSource.close();
         }
@@ -360,7 +429,7 @@
             showError(d.error || 'Processing failed');
             isProcessing = false;
             document.getElementById('btn-start').disabled = false;
-            document.getElementById('btn-start').textContent = 'Start Upscaling';
+            updateStartButton();
             if (eventSource) eventSource.close();
         }
     }
@@ -389,6 +458,7 @@
             queued: 'Queued',
             extracting: 'Extracting frames',
             upscaling: 'Upscaling',
+            removing_background: 'Removing background',
             encoding: 'Encoding segment',
             concatenating: 'Concatenating',
             muxing_audio: 'Muxing audio',

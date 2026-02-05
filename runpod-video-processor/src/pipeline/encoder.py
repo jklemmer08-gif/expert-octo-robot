@@ -5,11 +5,13 @@ import os
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
-from src.config import DEFAULT_CRF, DEFAULT_CODEC, DEFAULT_PRESET, FALLBACK_CODEC
+from src.config import DEFAULT_CRF, DEFAULT_CODEC, DEFAULT_PRESET, DEFAULT_VP9_CRF, FALLBACK_CODEC
 from src.utils.ffmpeg import (
     build_concat_cmd,
     build_encode_segment_cmd,
+    build_encode_segment_vp9_cmd,
     build_mux_audio_cmd,
+    build_mux_audio_webm_cmd,
     check_nvenc_available,
     has_audio,
     run_ffmpeg,
@@ -118,4 +120,47 @@ def mux_audio(
     cmd = build_mux_audio_cmd(video_path, audio_source_path, output_path, extra_flags)
     run_ffmpeg(cmd)
     logger.info("Muxed audio from %s → %s", audio_source_path, output_path)
+    return output_path
+
+
+def encode_segment_vp9(
+    frame_pattern: str,
+    output_path: str,
+    fps: float,
+    width: int,
+    height: int,
+    crf: int = DEFAULT_VP9_CRF,
+    speed: int = 4,
+) -> str:
+    """Encode RGBA PNG frames into a VP9 WebM clip with alpha. Returns output path."""
+    cmd = build_encode_segment_vp9_cmd(
+        input_pattern=frame_pattern,
+        output_path=output_path,
+        fps=fps,
+        width=width,
+        height=height,
+        crf=crf,
+        speed=speed,
+    )
+    run_ffmpeg(cmd)
+    logger.info("Encoded VP9 segment: %s", output_path)
+    return output_path
+
+
+def mux_audio_webm(
+    video_path: str,
+    audio_source_path: str,
+    output_path: str,
+    extra_flags: Optional[List[str]] = None,
+) -> str:
+    """Mux audio from the original into WebM, transcoding to Opus."""
+    if not has_audio(audio_source_path):
+        logger.info("No audio streams found in source — skipping audio mux")
+        if video_path != output_path:
+            os.rename(video_path, output_path)
+        return output_path
+
+    cmd = build_mux_audio_webm_cmd(video_path, audio_source_path, output_path, extra_flags)
+    run_ffmpeg(cmd)
+    logger.info("Muxed audio (Opus) from %s → %s", audio_source_path, output_path)
     return output_path

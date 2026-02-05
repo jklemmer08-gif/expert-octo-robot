@@ -46,7 +46,17 @@ RUN mkdir -p /app/models && \
         "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.2.4/RealESRGAN_x4plus_anime_6B.pth" && \
     wget -q -O /app/models/RealESRGAN_x2plus.pth \
         "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth" && \
-    echo "Models downloaded:" && ls -lh /app/models/
+    echo "Real-ESRGAN models downloaded:" && ls -lh /app/models/
+
+# ============================================================
+# RVM (Robust Video Matting) TorchScript models (baked in)
+# ============================================================
+RUN mkdir -p /app/models/rvm && \
+    wget -q -O /app/models/rvm/rvm_resnet50_fp32.torchscript \
+        "https://github.com/PeterL1n/RobustVideoMatting/releases/download/v1.0.0/rvm_resnet50_fp32.torchscript" && \
+    wget -q -O /app/models/rvm/rvm_mobilenetv3_fp32.torchscript \
+        "https://github.com/PeterL1n/RobustVideoMatting/releases/download/v1.0.0/rvm_mobilenetv3_fp32.torchscript" && \
+    echo "RVM models downloaded:" && ls -lh /app/models/rvm/
 
 # ============================================================
 # Application code
