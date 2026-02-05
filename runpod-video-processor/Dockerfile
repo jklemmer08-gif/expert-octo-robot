@@ -7,6 +7,7 @@ LABEL description="GPU-accelerated video upscaling with Real-ESRGAN"
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
+ENV PYTHONPATH=/app
 ENV NVIDIA_VISIBLE_DEVICES=all
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
 
