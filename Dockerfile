@@ -8,7 +8,7 @@ FROM nvidia/cuda:12.4.0-devel-ubuntu22.04
 
 LABEL maintainer="jklemmer08-gif@github.com"
 LABEL description="GPU-accelerated VR video processing with background removal"
-LABEL version="2.1-vpf"
+LABEL version="2.2-vpf"
 
 # Set environment variables
 ENV DEBIAN_FRONTEND=noninteractive
@@ -38,6 +38,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libvpx-dev \
     libaom-dev \
     && rm -rf /var/lib/apt/lists/*
+
+# Install croc for peer-to-peer file transfer (works through NAT, supports resume)
+RUN curl https://getcroc.schollz.com | bash
 
 # Create workspace directory
 WORKDIR /workspace
@@ -91,14 +94,12 @@ result = subprocess.run(['ffmpeg', '-version'], capture_output=True, text=True);
 print(f'FFmpeg: {result.stdout.split(chr(10))[0]}'); \
 "
 
-# Verify VPF is installed (import test runs at runtime with GPU)
+# Verify VPF and croc are installed
 RUN pip3 show PyNvVideoCodec && echo "VPF (PyNvVideoCodec): Installed" && \
+    croc --version && \
     echo "============================================================" && \
     echo "All dependencies installed successfully!" && \
     echo "============================================================"
 
-# Expose port for potential web UI
-EXPOSE 8888
-
-# Keep container running for SSH access
+# Keep container running for SSH/web terminal access
 CMD ["sleep", "infinity"]
