@@ -37,7 +37,7 @@ def detect_gpu() -> dict:
         if not torch.cuda.is_available():
             return {"name": None, "vram_gb": 0, "count": 0}
         name = torch.cuda.get_device_name(0)
-        vram_bytes = torch.cuda.get_device_properties(0).total_mem
+        vram_bytes = torch.cuda.get_device_properties(0).total_memory
         vram_gb = round(vram_bytes / (1024 ** 3), 1)
         count = torch.cuda.device_count()
         return {"name": name, "vram_gb": vram_gb, "count": count}
@@ -91,7 +91,7 @@ def get_vram_usage() -> dict:
         import torch
         if not torch.cuda.is_available():
             return {"total_gb": 0, "used_gb": 0, "free_gb": 0}
-        total = torch.cuda.get_device_properties(0).total_mem
+        total = torch.cuda.get_device_properties(0).total_memory
         reserved = torch.cuda.memory_reserved(0)
         allocated = torch.cuda.memory_allocated(0)
         return {
