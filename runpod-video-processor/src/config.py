@@ -23,7 +23,7 @@ FALLBACK_CODEC = "libx265"
 DEFAULT_SCALE = int(os.getenv("DEFAULT_SCALE", "4"))
 DEFAULT_TILE_SIZE = int(os.getenv("DEFAULT_TILE_SIZE", "512"))
 TILE_RETRY_SIZES = [512, 384, 256, 128]
-MODEL_DIR = Path(os.getenv("MODEL_DIR", "/workspace/app/models"))
+MODEL_DIR = Path(os.getenv("MODEL_DIR", "/app/models"))
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "RealESRGAN_x4plus")
 SEGMENT_SIZE = int(os.getenv("SEGMENT_SIZE", "1000"))
 
@@ -31,7 +31,7 @@ SEGMENT_SIZE = int(os.getenv("SEGMENT_SIZE", "1000"))
 DEFAULT_RVM_MODEL = os.getenv("DEFAULT_RVM_MODEL", "resnet50")
 DEFAULT_DOWNSAMPLE_RATIO = float(os.getenv("DEFAULT_DOWNSAMPLE_RATIO", "0.5"))
 DEFAULT_RVM_BATCH_SIZE = int(os.getenv("DEFAULT_RVM_BATCH_SIZE", "8"))
-RVM_MODEL_DIR = Path(os.getenv("RVM_MODEL_DIR", "/workspace/app/models/rvm"))
+RVM_MODEL_DIR = Path(os.getenv("RVM_MODEL_DIR", "/app/models/rvm"))
 DEFAULT_VP9_CRF = int(os.getenv("DEFAULT_VP9_CRF", "30"))
 
 AVAILABLE_RVM_MODELS = {
