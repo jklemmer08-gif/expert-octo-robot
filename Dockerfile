@@ -91,21 +91,11 @@ result = subprocess.run(['ffmpeg', '-version'], capture_output=True, text=True);
 print(f'FFmpeg: {result.stdout.split(chr(10))[0]}'); \
 "
 
-# Test VPF import separately (may need GPU)
-RUN python3 -c "\
-try: \
-    import PyNvVideoCodec as vpf; \
-    print('VPF (PyNvVideoCodec): Installed'); \
-except ImportError as e: \
-    print(f'VPF import note: {e}'); \
-    print('VPF may require GPU at runtime'); \
-"
-
-RUN python3 -c "\
-print('=' * 60); \
-print('All dependencies installed successfully!'); \
-print('=' * 60); \
-"
+# Verify VPF is installed (import test runs at runtime with GPU)
+RUN pip3 show PyNvVideoCodec && echo "VPF (PyNvVideoCodec): Installed" && \
+    echo "============================================================" && \
+    echo "All dependencies installed successfully!" && \
+    echo "============================================================"
 
 # Expose port for potential web UI
 EXPOSE 8888
