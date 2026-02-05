@@ -34,6 +34,8 @@ from src.config import (
     TEMP_DIR,
     TILE_RETRY_SIZES,
     AVAILABLE_MODELS,
+    TRT_TILE_SIZE,
+    TRT_TILE_PAD,
 )
 from src.pipeline.detector import VRLayout
 from src.pipeline.encoder import encode_segment, concatenate_segments, mux_audio
@@ -49,6 +51,7 @@ from src.utils.ffmpeg import (
     build_decode_pipe_cmd,
     build_encode_pipe_cmd,
     build_extract_frames_cmd,
+    check_nvenc_encode_works,
     get_video_metadata,
     run_ffmpeg,
 )
@@ -453,6 +456,11 @@ def process_video_streaming(
     if codec is None:
         codec = get_encoder_codec()
 
+    # Streaming pipes can't retry mid-stream, so verify NVENC actually works
+    if codec == "hevc_nvenc" and not check_nvenc_encode_works():
+        logger.warning("NVENC listed but encode test failed — falling back to libx265")
+        codec = "libx265"
+
     try:
         # --- Get video metadata ---
         meta = get_video_metadata(input_path)
@@ -485,8 +493,23 @@ def process_video_streaming(
         if not check_disk_space(needed_gb):
             raise UpscaleError(f"Insufficient disk space: need ~{needed_gb:.1f} GB free")
 
-        # --- Load model once ---
-        upsampler = _load_model(model_name, scale, tile_size, device)
+        # --- Load model (TRT first, PyTorch fallback) ---
+        use_trt = False
+        from src.pipeline import trt_engine
+        if trt_engine.is_available():
+            try:
+                upsampler = trt_engine.TRTUpscaler(
+                    model_name, scale,
+                    tile_size=TRT_TILE_SIZE, tile_pad=TRT_TILE_PAD,
+                    device=device,
+                )
+                use_trt = True
+                logger.info("Using TensorRT (engine: %s)", trt_engine.get_gpu_arch())
+            except Exception as e:
+                logger.warning("TensorRT init failed, using PyTorch: %s", e)
+                upsampler = _load_model(model_name, scale, tile_size, device)
+        else:
+            upsampler = _load_model(model_name, scale, tile_size, device)
         effective_tile = tile_size
 
         # --- Process segments ---
@@ -538,14 +561,22 @@ def process_video_streaming(
                         except (RuntimeError,) as e:
                             if "out of memory" not in str(e).lower():
                                 raise
-                            logger.warning("OOM on VR frame, retrying with smaller tiles")
-                            torch.cuda.empty_cache()
-                            del upsampler
-                            remaining_tiles = [t for t in TILE_RETRY_SIZES if t < effective_tile]
-                            if not remaining_tiles:
-                                raise UpscaleError("OOM even with smallest tile size")
-                            effective_tile = remaining_tiles[0]
-                            upsampler = _load_model(model_name, scale, effective_tile, device)
+                            if use_trt:
+                                # TRT has fixed tiles; OOM means fall back to PyTorch
+                                logger.warning("TRT OOM on VR frame, falling back to PyTorch")
+                                torch.cuda.empty_cache()
+                                del upsampler
+                                use_trt = False
+                                upsampler = _load_model(model_name, scale, tile_size, device)
+                            else:
+                                logger.warning("OOM on VR frame, retrying with smaller tiles")
+                                torch.cuda.empty_cache()
+                                del upsampler
+                                remaining_tiles = [t for t in TILE_RETRY_SIZES if t < effective_tile]
+                                if not remaining_tiles:
+                                    raise UpscaleError("OOM even with smallest tile size")
+                                effective_tile = remaining_tiles[0]
+                                upsampler = _load_model(model_name, scale, effective_tile, device)
                             left_up = upscale_frame(upsampler, left_eye, outscale=scale)
                             right_up = upscale_frame(upsampler, right_eye, outscale=scale)
                         upscaled = _merge_vr_frame(left_up, right_up, layout)
@@ -555,14 +586,21 @@ def process_video_streaming(
                         except (RuntimeError,) as e:
                             if "out of memory" not in str(e).lower():
                                 raise
-                            logger.warning("OOM on frame %d, retrying with smaller tiles", frames_processed + i)
-                            torch.cuda.empty_cache()
-                            del upsampler
-                            remaining_tiles = [t for t in TILE_RETRY_SIZES if t < effective_tile]
-                            if not remaining_tiles:
-                                raise UpscaleError("OOM even with smallest tile size")
-                            effective_tile = remaining_tiles[0]
-                            upsampler = _load_model(model_name, scale, effective_tile, device)
+                            if use_trt:
+                                logger.warning("TRT OOM on frame %d, falling back to PyTorch", frames_processed + i)
+                                torch.cuda.empty_cache()
+                                del upsampler
+                                use_trt = False
+                                upsampler = _load_model(model_name, scale, tile_size, device)
+                            else:
+                                logger.warning("OOM on frame %d, retrying with smaller tiles", frames_processed + i)
+                                torch.cuda.empty_cache()
+                                del upsampler
+                                remaining_tiles = [t for t in TILE_RETRY_SIZES if t < effective_tile]
+                                if not remaining_tiles:
+                                    raise UpscaleError("OOM even with smallest tile size")
+                                effective_tile = remaining_tiles[0]
+                                upsampler = _load_model(model_name, scale, effective_tile, device)
                             upscaled = upscale_frame(upsampler, frame_bgr, outscale=scale)
 
                     write_frame(encode_proc, upscaled)
@@ -580,7 +618,7 @@ def process_video_streaming(
                     del frame_bgr, upscaled
 
             finally:
-                close_process(decode_proc, "decode")
+                close_process(decode_proc, "decode", tolerant=True)
                 close_process(encode_proc, "encode")
 
             segment_clips.append(seg_clip_path)
@@ -640,6 +678,7 @@ def process_video_streaming(
             "processing_time_sec": round(elapsed, 1),
             "avg_fps": round(frames_processed / elapsed, 2) if elapsed > 0 else 0,
             "streaming": True,
+            "backend": "tensorrt" if use_trt else "pytorch",
         }
 
         logger.info("Streaming processing complete: %s", result)

@@ -45,6 +45,12 @@ AVAILABLE_RVM_MODELS = {
     },
 }
 
+# --- TensorRT ---
+TRT_ENGINE_DIR = Path(os.getenv("TRT_ENGINE_DIR", str(WORKSPACE_DIR / "models" / "trt_engines")))
+TRT_ONNX_DIR = Path(os.getenv("TRT_ONNX_DIR", str(WORKSPACE_DIR / "models" / "onnx")))
+TRT_TILE_SIZE = int(os.getenv("TRT_TILE_SIZE", "1024"))
+TRT_TILE_PAD = int(os.getenv("TRT_TILE_PAD", "10"))
+
 # --- Device ---
 DEVICE = os.getenv("DEVICE", "cuda:0")
 GPU_ID = int(os.getenv("GPU_ID", "0"))
