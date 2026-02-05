@@ -1,6 +1,6 @@
-# Core ML (installed via PyTorch index in Dockerfile)
-# torch==2.2.0
-# torchvision==0.17.0
+# Core ML (pre-installed in base image)
+# torch==2.8.0 (from runpod/pytorch base image, CUDA 12.8.1)
+# torchvision (matching version from base image)
 
 # Upscaling
 realesrgan
@@ -15,6 +15,10 @@ flask>=3.0
 numpy<2
 Pillow
 opencv-python-headless
+
+# Optional: TensorRT acceleration (auto-installed on RunPod GPU pods)
+# tensorrt>=10.0
+# onnx>=1.14
 
 # Testing
 pytest
