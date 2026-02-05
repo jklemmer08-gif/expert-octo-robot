@@ -1,0 +1,19 @@
+services:
+  upscaler:
+    build: .
+    runtime: nvidia
+    ports:
+      - "8080:8080"
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
+      - WORKSPACE_DIR=/workspace
+      - DEFAULT_CRF=18
+      - DEFAULT_TILE_SIZE=512
+    volumes:
+      # Mount local test directories as the workspace
+      - ./test_input:/workspace/input
+      - ./test_output:/workspace/output
+      - ./test_temp:/workspace/temp
+    # Override CMD for local dev (auto-reload not supported, just run)
+    command: python3 -u /app/src/app.py

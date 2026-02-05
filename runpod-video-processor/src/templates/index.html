@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RunPod Video Processor</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { background: #0f172a; color: #e2e8f0; }
+        .card { background: #1e293b; border: 1px solid #334155; border-radius: 0.5rem; }
+        .btn { cursor: pointer; transition: all 0.15s; }
+        .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+        .progress-bar { transition: width 0.3s ease; }
+        select, input[type="number"] { background: #0f172a; border: 1px solid #475569; color: #e2e8f0; }
+        tr:hover { background: #334155; }
+        .status-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+        .dot-green { background: #22c55e; }
+        .dot-yellow { background: #eab308; }
+        .dot-red { background: #ef4444; }
+        .dot-gray { background: #64748b; }
+    </style>
+</head>
+<body class="min-h-screen p-4 md:p-8">
+    <div class="max-w-7xl mx-auto space-y-6">
+
+        <!-- Header -->
+        <div class="flex items-center justify-between">
+            <h1 class="text-2xl font-bold text-white">RunPod Video Processor</h1>
+            <div id="system-badge" class="text-sm text-slate-400"></div>
+        </div>
+
+        <!-- System Info Panel -->
+        <div class="card p-4">
+            <h2 class="text-sm font-semibold text-slate-400 uppercase mb-3">System</h2>
+            <div class="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm" id="system-info">
+                <div>
+                    <div class="text-slate-400">GPU</div>
+                    <div id="si-gpu" class="font-mono">--</div>
+                </div>
+                <div>
+                    <div class="text-slate-400">VRAM</div>
+                    <div id="si-vram" class="font-mono">--</div>
+                </div>
+                <div>
+                    <div class="text-slate-400">Disk Free</div>
+                    <div id="si-disk" class="font-mono">--</div>
+                </div>
+                <div>
+                    <div class="text-slate-400">Profile</div>
+                    <div id="si-profile" class="font-mono">--</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Progress Panel (hidden when idle) -->
+        <div id="progress-panel" class="card p-4 hidden">
+            <h2 class="text-sm font-semibold text-slate-400 uppercase mb-3">Processing</h2>
+            <div class="space-y-3">
+                <div class="flex justify-between text-sm">
+                    <span id="prog-stage" class="capitalize">--</span>
+                    <span id="prog-eta" class="text-slate-400">--</span>
+                </div>
+                <div class="w-full bg-slate-700 rounded-full h-3">
+                    <div id="prog-bar" class="bg-blue-500 h-3 rounded-full progress-bar" style="width: 0%"></div>
+                </div>
+                <div class="flex justify-between text-xs text-slate-400">
+                    <span id="prog-frames">Frame 0 / 0</span>
+                    <span id="prog-segment">Segment 0 / 0</span>
+                    <span id="prog-percent">0%</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- Error Display -->
+        <div id="error-panel" class="card p-4 border-red-500/50 hidden">
+            <div class="flex items-start gap-3">
+                <span class="text-red-400 text-lg">&#x2716;</span>
+                <div>
+                    <div class="font-semibold text-red-400">Error</div>
+                    <div id="error-msg" class="text-sm text-slate-300 mt-1"></div>
+                </div>
+            </div>
+        </div>
+
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+
+            <!-- Input Files -->
+            <div class="lg:col-span-2 card p-4">
+                <div class="flex items-center justify-between mb-3">
+                    <h2 class="text-sm font-semibold text-slate-400 uppercase">Input Files</h2>
+                    <button onclick="loadInputFiles()" class="btn text-xs text-blue-400 hover:text-blue-300">Refresh</button>
+                </div>
+                <div class="overflow-x-auto">
+                    <table class="w-full text-sm">
+                        <thead>
+                            <tr class="text-left text-slate-400 border-b border-slate-700">
+                                <th class="pb-2 pr-4">File</th>
+                                <th class="pb-2 pr-4">Size</th>
+                                <th class="pb-2 pr-4">Resolution</th>
+                                <th class="pb-2 pr-4">Duration</th>
+                                <th class="pb-2 pr-4">Layout</th>
+                                <th class="pb-2"></th>
+                            </tr>
+                        </thead>
+                        <tbody id="input-files-body" class="text-slate-300">
+                            <tr><td colspan="6" class="py-4 text-center text-slate-500">Loading...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Job Configuration -->
+            <div class="card p-4">
+                <h2 class="text-sm font-semibold text-slate-400 uppercase mb-3">Upscale Settings</h2>
+                <div class="space-y-4">
+                    <div>
+                        <label class="block text-xs text-slate-400 mb-1">Selected File</label>
+                        <div id="selected-file" class="text-sm font-mono truncate text-slate-500">None</div>
+                        <input type="hidden" id="selected-path" value="">
+                    </div>
+                    <div>
+                        <label class="block text-xs text-slate-400 mb-1">Model</label>
+                        <select id="cfg-model" class="w-full rounded px-3 py-2 text-sm">
+                            <option value="RealESRGAN_x4plus">General (live action)</option>
+                            <option value="RealESRGAN_x4plus_anime_6B">Animation / anime</option>
+                            <option value="RealESRGAN_x2plus">2x upscale (general)</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="block text-xs text-slate-400 mb-1">Scale</label>
+                        <select id="cfg-scale" class="w-full rounded px-3 py-2 text-sm">
+                            <option value="4">4x</option>
+                            <option value="2">2x</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="block text-xs text-slate-400 mb-1">CRF (15=high quality, 28=small file)</label>
+                        <input type="number" id="cfg-crf" value="18" min="15" max="28" class="w-full rounded px-3 py-2 text-sm">
+                    </div>
+                    <div>
+                        <label class="block text-xs text-slate-400 mb-1">VR Layout</label>
+                        <select id="cfg-layout" class="w-full rounded px-3 py-2 text-sm">
+                            <option value="auto">Auto-detect</option>
+                            <option value="sbs">Side-by-Side</option>
+                            <option value="ou">Over-Under</option>
+                            <option value="mono">Mono VR</option>
+                            <option value="2d">2D (not VR)</option>
+                        </select>
+                    </div>
+                    <button id="btn-start" onclick="startJob()" disabled
+                            class="btn w-full bg-blue-600 hover:bg-blue-500 text-white rounded py-2 px-4 text-sm font-medium">
+                        Select a file to start
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Output Files -->
+        <div class="card p-4">
+            <div class="flex items-center justify-between mb-3">
+                <h2 class="text-sm font-semibold text-slate-400 uppercase">Output Files</h2>
+                <button onclick="loadOutputFiles()" class="btn text-xs text-blue-400 hover:text-blue-300">Refresh</button>
+            </div>
+            <div class="overflow-x-auto">
+                <table class="w-full text-sm">
+                    <thead>
+                        <tr class="text-left text-slate-400 border-b border-slate-700">
+                            <th class="pb-2 pr-4">File</th>
+                            <th class="pb-2 pr-4">Size</th>
+                            <th class="pb-2 pr-4">Resolution</th>
+                            <th class="pb-2">Duration</th>
+                        </tr>
+                    </thead>
+                    <tbody id="output-files-body" class="text-slate-300">
+                        <tr><td colspan="4" class="py-4 text-center text-slate-500">Loading...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+    </div>
+
+    <script>
+    // --- State ---
+    let selectedFile = null;
+    let eventSource = null;
+    let isProcessing = false;
+
+    // --- API Helpers ---
+    async function api(url, opts = {}) {
+        const res = await fetch(url, {
+            headers: { 'Content-Type': 'application/json' },
+            ...opts,
+        });
+        return res.json();
+    }
+
+    // --- System Info ---
+    async function loadSystemInfo() {
+        try {
+            const sys = await api('/api/system');
+            document.getElementById('si-gpu').textContent = sys.gpu.name || 'No GPU';
+            document.getElementById('si-vram').textContent =
+                sys.vram.total_gb > 0 ? `${sys.vram.used_gb}/${sys.vram.total_gb} GB` : '--';
+            document.getElementById('si-disk').textContent = `${sys.disk.free_gb} GB`;
+            document.getElementById('si-profile').textContent =
+                `${sys.profile.name} (tile=${sys.profile.tile_size})`;
+            document.getElementById('system-badge').textContent =
+                sys.gpu.count > 0 ? `${sys.gpu.count} GPU(s)` : 'CPU only';
+        } catch (e) {
+            console.error('Failed to load system info:', e);
+        }
+    }
+
+    // --- Input Files ---
+    async function loadInputFiles() {
+        try {
+            const files = await api('/api/files/input');
+            const tbody = document.getElementById('input-files-body');
+            if (files.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="6" class="py-4 text-center text-slate-500">No files in /workspace/input/</td></tr>';
+                return;
+            }
+            tbody.innerHTML = files.map(f => `
+                <tr class="border-b border-slate-700/50 cursor-pointer" onclick="selectFile('${f.path}', '${f.name}', '${f.layout || "unknown"}')">
+                    <td class="py-2 pr-4 font-mono text-xs truncate max-w-xs" title="${f.name}">${f.name}</td>
+                    <td class="py-2 pr-4 whitespace-nowrap">${f.size_gb} GB</td>
+                    <td class="py-2 pr-4 whitespace-nowrap">${f.width || '?'}x${f.height || '?'}</td>
+                    <td class="py-2 pr-4 whitespace-nowrap">${f.duration ? formatDuration(f.duration) : '?'}</td>
+                    <td class="py-2 pr-4">
+                        <span class="px-2 py-0.5 rounded text-xs ${layoutBadgeClass(f.layout)}">${(f.layout || 'unknown').toUpperCase()}</span>
+                    </td>
+                    <td class="py-2">
+                        <button class="btn text-xs text-blue-400 hover:text-blue-300">Select</button>
+                    </td>
+                </tr>
+            `).join('');
+        } catch (e) {
+            console.error('Failed to load input files:', e);
+        }
+    }
+
+    // --- Output Files ---
+    async function loadOutputFiles() {
+        try {
+            const files = await api('/api/files/output');
+            const tbody = document.getElementById('output-files-body');
+            if (files.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="4" class="py-4 text-center text-slate-500">No output files yet</td></tr>';
+                return;
+            }
+            tbody.innerHTML = files.map(f => `
+                <tr class="border-b border-slate-700/50">
+                    <td class="py-2 pr-4 font-mono text-xs truncate max-w-xs">${f.name}</td>
+                    <td class="py-2 pr-4">${f.size_gb} GB</td>
+                    <td class="py-2 pr-4">${f.width || '?'}x${f.height || '?'}</td>
+                    <td class="py-2">${f.duration ? formatDuration(f.duration) : '?'}</td>
+                </tr>
+            `).join('');
+        } catch (e) {
+            console.error('Failed to load output files:', e);
+        }
+    }
+
+    // --- File Selection ---
+    function selectFile(path, name, layout) {
+        selectedFile = { path, name, layout };
+        document.getElementById('selected-file').textContent = name;
+        document.getElementById('selected-file').classList.remove('text-slate-500');
+        document.getElementById('selected-file').classList.add('text-white');
+        document.getElementById('selected-path').value = path;
+        document.getElementById('btn-start').disabled = false;
+        document.getElementById('btn-start').textContent = 'Start Upscaling';
+
+        if (layout && layout !== 'unknown' && layout !== '2d') {
+            document.getElementById('cfg-layout').value = layout;
+        }
+    }
+
+    // --- Start Job ---
+    async function startJob() {
+        if (!selectedFile || isProcessing) return;
+
+        const btn = document.getElementById('btn-start');
+        btn.disabled = true;
+        btn.textContent = 'Starting...';
+        hideError();
+
+        try {
+            const res = await fetch('/api/process', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    input_path: selectedFile.path,
+                    model: document.getElementById('cfg-model').value,
+                    scale: parseInt(document.getElementById('cfg-scale').value),
+                    crf: parseInt(document.getElementById('cfg-crf').value),
+                    layout: document.getElementById('cfg-layout').value,
+                }),
+            });
+
+            const data = await res.json();
+            if (!res.ok) {
+                showError(data.errors ? data.errors.join('; ') : data.error || 'Unknown error');
+                btn.disabled = false;
+                btn.textContent = 'Start Upscaling';
+                return;
+            }
+
+            isProcessing = true;
+            btn.textContent = 'Processing...';
+            connectSSE();
+
+        } catch (e) {
+            showError('Failed to start job: ' + e.message);
+            btn.disabled = false;
+            btn.textContent = 'Start Upscaling';
+        }
+    }
+
+    // --- SSE Progress ---
+    function connectSSE() {
+        if (eventSource) eventSource.close();
+
+        eventSource = new EventSource('/api/progress');
+        const panel = document.getElementById('progress-panel');
+        panel.classList.remove('hidden');
+
+        eventSource.onmessage = (e) => {
+            const d = JSON.parse(e.data);
+            updateProgress(d);
+        };
+
+        eventSource.onerror = () => {
+            console.warn('SSE connection lost, reconnecting...');
+        };
+    }
+
+    function updateProgress(d) {
+        document.getElementById('prog-stage').textContent = formatStage(d.stage);
+        document.getElementById('prog-frames').textContent = `Frame ${d.frame} / ${d.total_frames}`;
+        document.getElementById('prog-segment').textContent = `Segment ${d.segment || 0} / ${d.total_segments || 0}`;
+        document.getElementById('prog-percent').textContent = `${d.percent}%`;
+        document.getElementById('prog-bar').style.width = `${d.percent}%`;
+        document.getElementById('prog-eta').textContent = d.eta_sec ? `ETA: ${formatDuration(d.eta_sec)}` : '';
+
+        if (d.stage === 'completed') {
+            document.getElementById('prog-bar').classList.remove('bg-blue-500');
+            document.getElementById('prog-bar').classList.add('bg-green-500');
+            isProcessing = false;
+            document.getElementById('btn-start').disabled = false;
+            document.getElementById('btn-start').textContent = 'Start Upscaling';
+            loadOutputFiles();
+            if (eventSource) eventSource.close();
+        }
+
+        if (d.stage === 'failed') {
+            document.getElementById('prog-bar').classList.remove('bg-blue-500');
+            document.getElementById('prog-bar').classList.add('bg-red-500');
+            showError(d.error || 'Processing failed');
+            isProcessing = false;
+            document.getElementById('btn-start').disabled = false;
+            document.getElementById('btn-start').textContent = 'Start Upscaling';
+            if (eventSource) eventSource.close();
+        }
+    }
+
+    // --- Error Display ---
+    function showError(msg) {
+        document.getElementById('error-panel').classList.remove('hidden');
+        document.getElementById('error-msg').textContent = msg;
+    }
+    function hideError() {
+        document.getElementById('error-panel').classList.add('hidden');
+    }
+
+    // --- Helpers ---
+    function formatDuration(sec) {
+        const h = Math.floor(sec / 3600);
+        const m = Math.floor((sec % 3600) / 60);
+        const s = Math.floor(sec % 60);
+        if (h > 0) return `${h}h ${m}m`;
+        if (m > 0) return `${m}m ${s}s`;
+        return `${s}s`;
+    }
+
+    function formatStage(stage) {
+        const stages = {
+            queued: 'Queued',
+            extracting: 'Extracting frames',
+            upscaling: 'Upscaling',
+            encoding: 'Encoding segment',
+            concatenating: 'Concatenating',
+            muxing_audio: 'Muxing audio',
+            writing_metadata: 'Writing metadata',
+            completed: 'Completed',
+            failed: 'Failed',
+        };
+        return stages[stage] || stage;
+    }
+
+    function layoutBadgeClass(layout) {
+        switch (layout) {
+            case 'sbs': return 'bg-purple-500/20 text-purple-300';
+            case 'ou': return 'bg-indigo-500/20 text-indigo-300';
+            case 'mono': return 'bg-cyan-500/20 text-cyan-300';
+            case '2d': return 'bg-slate-500/20 text-slate-300';
+            default: return 'bg-slate-500/20 text-slate-400';
+        }
+    }
+
+    // --- Init ---
+    loadSystemInfo();
+    loadInputFiles();
+    loadOutputFiles();
+
+    // Refresh system info every 30s
+    setInterval(loadSystemInfo, 30000);
+    </script>
+</body>
+</html>
