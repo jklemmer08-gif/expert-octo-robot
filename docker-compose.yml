@@ -1,0 +1,45 @@
+version: '3.8'
+
+services:
+  vr-processor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: vr-processor:latest
+    container_name: vr-processor-gpu
+    
+    # GPU support
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - TORCH_HOME=/workspace/.torch
+    
+    # Volume mounts
+    volumes:
+      # Input directories
+      - ./input_gpu0:/workspace/input_gpu0:ro
+      - ./input_gpu1:/workspace/input_gpu1:ro
+      # Output directory
+      - ./output:/workspace/output:rw
+      # Cache directory
+      - vr-torch-cache:/workspace/.torch
+    
+    # Working directory
+    working_dir: /workspace/app
+    
+    # Keep container running
+    stdin_open: true
+    tty: true
+    
+    # Resource limits (adjust as needed)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  vr-torch-cache:
+    driver: local
