@@ -19,7 +19,7 @@ print(f"Codec: {demuxer.GetNvCodecId()}")
 
 frame_count = 0
 for packet in demuxer:
-    frames = decoder.decode(packet)
+    frames = decoder.Decode(packet)
     for frame in frames:
         frame_count += 1
         if frame_count == 1:
@@ -27,7 +27,7 @@ for packet in demuxer:
             if hasattr(frame, 'shape'):
                 print(f"Frame shape: {frame.shape}")
 
-frames = decoder.decode(None)
+frames = decoder.Decode(None)
 for frame in frames:
     frame_count += 1
 
