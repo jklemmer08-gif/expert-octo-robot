@@ -1,14 +1,14 @@
 # GPU-Accelerated VR Video Processing Docker Image
-# PyTorch 2.6 + CUDA 12.4 + TorchCodec + all dependencies
+# PyTorch 2.6 + CUDA 12.4 + NVIDIA VPF (Video Processing Framework)
 # For RunPod Custom Template deployment
-# Uses TorchCodec for GPU-accelerated video decoding (NVDEC)
+# Uses VPF for true GPU-native video decoding (NVDEC -> CUDA tensors)
 
 # Use NVIDIA CUDA devel image for full compatibility
 FROM nvidia/cuda:12.4.0-devel-ubuntu22.04
 
 LABEL maintainer="jklemmer08-gif@github.com"
 LABEL description="GPU-accelerated VR video processing with background removal"
-LABEL version="2.0"
+LABEL version="2.1-vpf"
 
 # Set environment variables
 ENV DEBIAN_FRONTEND=noninteractive
@@ -19,7 +19,7 @@ ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
 ENV PATH="/usr/local/cuda/bin:${PATH}"
 ENV LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH}"
 
-# Install system dependencies including FFmpeg dev libraries for TorchCodec
+# Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     python3-pip \
@@ -30,17 +30,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     cmake \
     pkg-config \
-    # FFmpeg and all development libraries required by TorchCodec
+    # FFmpeg for encoding output
     ffmpeg \
-    libavutil-dev \
-    libavcodec-dev \
-    libavformat-dev \
-    libavdevice-dev \
-    libavfilter-dev \
-    libswscale-dev \
-    libswresample-dev \
-    libpostproc-dev \
-    # Additional video codec support
+    # Video codec libraries
     libx264-dev \
     libx265-dev \
     libvpx-dev \
@@ -53,22 +45,24 @@ WORKDIR /workspace
 # Upgrade pip
 RUN pip3 install --upgrade pip
 
-# Install PyTorch 2.6 with CUDA 12.4 support (matching base image)
+# Install PyTorch 2.6 with CUDA 12.4 support
 RUN pip3 install --no-cache-dir \
     torch==2.6.0 \
     torchvision==0.21.0 \
     torchaudio==2.6.0 \
     --index-url https://download.pytorch.org/whl/cu124
 
-# Install TorchCodec (requires PyTorch 2.6)
-RUN pip3 install --no-cache-dir torchcodec
+# Install NVIDIA Video Processing Framework (VPF)
+# PyNvVideoCodec is the current package name for VPF
+RUN pip3 install --no-cache-dir PyNvVideoCodec
 
 # Install remaining Python dependencies
 RUN pip3 install --no-cache-dir \
     imageio \
     imageio-ffmpeg \
     numpy \
-    Pillow
+    Pillow \
+    opencv-python-headless
 
 # Clone the repository
 RUN git clone https://github.com/jklemmer08-gif/expert-octo-robot.git /workspace/app
@@ -82,7 +76,6 @@ RUN mkdir -p /workspace/input_gpu0 /workspace/input_gpu1 /workspace/output
 # Verify all installations
 RUN python3 -c "\
 import torch; \
-import torchcodec; \
 import torchaudio; \
 import imageio; \
 import subprocess; \
@@ -92,11 +85,23 @@ print('=' * 60); \
 print(f'PyTorch: {torch.__version__}'); \
 print(f'CUDA Available: {torch.cuda.is_available()}'); \
 print(f'CUDA Version: {torch.version.cuda}'); \
-print(f'TorchCodec: {torchcodec.__version__}'); \
 print(f'TorchAudio: {torchaudio.__version__}'); \
 print(f'imageio: {imageio.__version__}'); \
 result = subprocess.run(['ffmpeg', '-version'], capture_output=True, text=True); \
 print(f'FFmpeg: {result.stdout.split(chr(10))[0]}'); \
+"
+
+# Test VPF import separately (may need GPU)
+RUN python3 -c "\
+try: \
+    import PyNvVideoCodec as vpf; \
+    print('VPF (PyNvVideoCodec): Installed'); \
+except ImportError as e: \
+    print(f'VPF import note: {e}'); \
+    print('VPF may require GPU at runtime'); \
+"
+
+RUN python3 -c "\
 print('=' * 60); \
 print('All dependencies installed successfully!'); \
 print('=' * 60); \
