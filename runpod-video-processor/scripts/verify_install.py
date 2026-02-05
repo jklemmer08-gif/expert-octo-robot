@@ -32,13 +32,13 @@ print("basicsr RRDBNet: OK")
 from realesrgan import RealESRGANer
 print("Real-ESRGAN: OK")
 
-models = list(pathlib.Path("/app/models").glob("*.pth"))
+models = list(pathlib.Path("/workspace/app/models").glob("*.pth"))
 print(f"Real-ESRGAN Models: {len(models)} found")
 for m in models:
     print(f"  - {m.name} ({m.stat().st_size / 1e6:.1f} MB)")
 
 # Verify RVM TorchScript models
-rvm_dir = pathlib.Path("/app/models/rvm")
+rvm_dir = pathlib.Path("/workspace/app/models/rvm")
 rvm_models = list(rvm_dir.glob("*.torchscript"))
 print(f"RVM Models: {len(rvm_models)} found")
 for m in rvm_models:
