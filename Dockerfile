@@ -100,5 +100,5 @@ RUN pip3 show PyNvVideoCodec && echo "VPF (PyNvVideoCodec): Installed" && \
 # Expose port for potential web UI
 EXPOSE 8888
 
-# Set default command
-CMD ["bash"]
+# Keep container running for SSH access
+CMD ["sleep", "infinity"]
