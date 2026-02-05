@@ -28,8 +28,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt \
-    --extra-index-url https://download.pytorch.org/whl/cu121
+RUN pip install --no-cache-dir --ignore-installed blinker && \
+    pip install --no-cache-dir -r requirements.txt \
+    --extra-index-url https://download.pytorch.org/whl/cu121 && \
+    # Fix basicsr compatibility with torchvision >= 0.17 \
+    # (functional_tensor was removed, use functional instead) \
+    sed -i 's/from torchvision.transforms.functional_tensor import rgb_to_grayscale/from torchvision.transforms.functional import rgb_to_grayscale/' \
+    /usr/local/lib/python3.10/dist-packages/basicsr/data/degradations.py
 
 # ============================================================
 # Real-ESRGAN model weights (baked in — no runtime downloads)
@@ -53,42 +58,14 @@ COPY src/ /app/src/
 # ============================================================
 RUN mkdir -p /workspace/input /workspace/output /workspace/temp
 
-# ============================================================
-# Verify installation
-# ============================================================
-RUN python3 -c "\
-import torch; \
-import cv2; \
-import flask; \
-print('=' * 60); \
-print('DOCKER IMAGE VERIFICATION'); \
-print('=' * 60); \
-print(f'PyTorch: {torch.__version__}'); \
-print(f'CUDA Available: {torch.cuda.is_available()}'); \
-print(f'CUDA Version: {torch.version.cuda}'); \
-print(f'OpenCV: {cv2.__version__}'); \
-print(f'Flask: {flask.__version__}'); \
-import subprocess; \
-r = subprocess.run(['ffmpeg', '-version'], capture_output=True, text=True); \
-print(f'FFmpeg: {r.stdout.splitlines()[0]}'); \
-# Check NVENC \
-r2 = subprocess.run(['ffmpeg', '-hide_banner', '-encoders'], capture_output=True, text=True); \
-nvenc = 'hevc_nvenc' in r2.stdout; \
-print(f'NVENC (hevc_nvenc): {\"Available\" if nvenc else \"Not available — will use libx265\"}'); \
-# Verify Real-ESRGAN can be imported \
-from basicsr.archs.rrdbnet_arch import RRDBNet; \
-from realesrgan import RealESRGANer; \
-print('Real-ESRGAN: OK'); \
-import pathlib; \
-models = list(pathlib.Path('/app/models').glob('*.pth')); \
-print(f'Models: {len(models)} found'); \
-for m in models: print(f'  - {m.name} ({m.stat().st_size / 1e6:.1f} MB)'); \
-print('=' * 60); \
-"
-
 EXPOSE 8080
 
 COPY scripts/ /app/scripts/
 RUN chmod +x /app/scripts/*.sh
+
+# ============================================================
+# Verify installation
+# ============================================================
+RUN python3 /app/scripts/verify_install.py
 
 CMD ["python3", "-u", "/app/src/app.py"]
