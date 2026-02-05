@@ -25,9 +25,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # ============================================================
 # Python dependencies
 # ============================================================
-WORKDIR /workspace/app
+WORKDIR /app
 
-COPY requirements.txt /workspace/app/requirements.txt
+COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir --ignore-installed blinker && \
     pip install --no-cache-dir -r requirements.txt \
     --extra-index-url https://download.pytorch.org/whl/cu121 && \
@@ -39,29 +39,29 @@ RUN pip install --no-cache-dir --ignore-installed blinker && \
 # ============================================================
 # Real-ESRGAN model weights (baked in — no runtime downloads)
 # ============================================================
-RUN mkdir -p /workspace/app/models && \
-    wget -q -O /workspace/app/models/RealESRGAN_x4plus.pth \
+RUN mkdir -p /app/models && \
+    wget -q -O /app/models/RealESRGAN_x4plus.pth \
         "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth" && \
-    wget -q -O /workspace/app/models/RealESRGAN_x4plus_anime_6B.pth \
+    wget -q -O /app/models/RealESRGAN_x4plus_anime_6B.pth \
         "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.2.4/RealESRGAN_x4plus_anime_6B.pth" && \
-    wget -q -O /workspace/app/models/RealESRGAN_x2plus.pth \
+    wget -q -O /app/models/RealESRGAN_x2plus.pth \
         "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth" && \
-    echo "Real-ESRGAN models downloaded:" && ls -lh /workspace/app/models/
+    echo "Real-ESRGAN models downloaded:" && ls -lh /app/models/
 
 # ============================================================
 # RVM (Robust Video Matting) TorchScript models (baked in)
 # ============================================================
-RUN mkdir -p /workspace/app/models/rvm && \
-    wget -q -O /workspace/app/models/rvm/rvm_resnet50_fp32.torchscript \
+RUN mkdir -p /app/models/rvm && \
+    wget -q -O /app/models/rvm/rvm_resnet50_fp32.torchscript \
         "https://github.com/PeterL1n/RobustVideoMatting/releases/download/v1.0.0/rvm_resnet50_fp32.torchscript" && \
-    wget -q -O /workspace/app/models/rvm/rvm_mobilenetv3_fp32.torchscript \
+    wget -q -O /app/models/rvm/rvm_mobilenetv3_fp32.torchscript \
         "https://github.com/PeterL1n/RobustVideoMatting/releases/download/v1.0.0/rvm_mobilenetv3_fp32.torchscript" && \
-    echo "RVM models downloaded:" && ls -lh /workspace/app/models/rvm/
+    echo "RVM models downloaded:" && ls -lh /app/models/rvm/
 
 # ============================================================
 # Application code
 # ============================================================
-COPY src/ /workspace/app/src/
+COPY src/ /app/src/
 
 # ============================================================
 # Workspace directories (created on volume mount or at runtime)
@@ -70,12 +70,12 @@ RUN mkdir -p /workspace/input /workspace/output /workspace/temp
 
 EXPOSE 8080
 
-COPY scripts/ /workspace/app/scripts/
-RUN chmod +x /workspace/app/scripts/*.sh
+COPY scripts/ /app/scripts/
+RUN chmod +x /app/scripts/*.sh
 
 # ============================================================
 # Verify installation
 # ============================================================
-RUN python3 /workspace/app/scripts/verify_install.py
+RUN python3 /app/scripts/verify_install.py
 
-CMD ["python3", "-u", "/workspace/app/src/app.py"]
+CMD ["python3", "-u", "/app/src/app.py"]
