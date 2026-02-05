@@ -48,11 +48,20 @@ def check_disk_space(needed_gb: float, path: Optional[Path] = None) -> bool:
 def estimate_segment_disk_gb(
     width: int, height: int, num_frames: int, scale: int = 4
 ) -> float:
-    """Estimate GB needed for one segment's frames on disk (input + upscaled PNGs)."""
-    # PNG size ~= width * height * 3 bytes (uncompressed RGB) * ~0.7 compression
-    input_frame_bytes = width * height * 3 * 0.7
-    output_frame_bytes = (width * scale) * (height * scale) * 3 * 0.7
-    total_bytes = (input_frame_bytes + output_frame_bytes) * num_frames
+    """Estimate GB needed for one segment's encoded clip on disk.
+
+    With the streaming pipeline, only the encoded segment clip is stored
+    (no input/output PNGs). Encoded video is ~50-100x smaller than raw PNGs.
+    """
+    # Encoded segment clip: ~2 MB per second at typical CRF settings
+    # At 30fps, 1000 frames = ~33s → ~66 MB. Use 100 MB as conservative estimate.
+    fps_estimate = 30.0
+    duration_sec = num_frames / fps_estimate
+    # Scale up for higher resolutions
+    pixel_count = (width * scale) * (height * scale)
+    resolution_factor = pixel_count / (1920 * 1080)  # relative to 1080p
+    bytes_per_sec = 3_000_000 * resolution_factor  # ~3 MB/s scaled by resolution
+    total_bytes = bytes_per_sec * duration_sec
     return total_bytes / (1024 ** 3)
 
 

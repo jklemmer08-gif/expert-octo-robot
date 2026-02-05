@@ -24,8 +24,8 @@ from src.config import (
 )
 from src.gpu import detect_gpu, get_gpu_profile, get_vram_usage
 from src.pipeline.detector import VRLayout, detect_layout
-from src.pipeline.bgremover import process_video as bgremove_video
-from src.pipeline.upscaler import process_video as upscale_video
+from src.pipeline.bgremover import process_video_streaming as bgremove_video
+from src.pipeline.upscaler import process_video_streaming as upscale_video
 from src.pipeline.validator import validate_input
 from src.storage.volume import (
     cleanup_orphaned_temp,

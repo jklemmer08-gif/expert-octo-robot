@@ -238,6 +238,101 @@ def build_mux_audio_cmd(
     return cmd
 
 
+def build_decode_pipe_cmd(
+    input_path: str,
+    start_frame: int,
+    num_frames: int,
+    fps: float,
+    width: int,
+    height: int,
+) -> List[str]:
+    """Build ffmpeg command to decode frames as raw BGR24 bytes to stdout.
+
+    Output: raw BGR24 bytes to pipe:1 (3 bytes/pixel, width * height * 3 per frame).
+    """
+    cmd = ["ffmpeg", "-nostdin", "-y"]
+
+    if start_frame > 0 and fps:
+        start_time = start_frame / fps
+        cmd.extend(["-ss", f"{start_time:.4f}"])
+
+    cmd.extend(["-i", str(input_path)])
+
+    if num_frames > 0:
+        cmd.extend(["-frames:v", str(num_frames)])
+
+    cmd.extend([
+        "-f", "rawvideo",
+        "-pix_fmt", "bgr24",
+        "-v", "error",
+        "pipe:1",
+    ])
+    return cmd
+
+
+def build_encode_pipe_cmd(
+    fps: float,
+    width: int,
+    height: int,
+    crf: int,
+    output_path: str,
+    codec: str = "hevc_nvenc",
+    preset: str = "slow",
+) -> List[str]:
+    """Build ffmpeg command to encode raw BGR24 bytes from stdin to video file.
+
+    Input: raw BGR24 from pipe:0 (3 bytes/pixel).
+    """
+    cmd = [
+        "ffmpeg", "-nostdin", "-y",
+        "-f", "rawvideo",
+        "-pix_fmt", "bgr24",
+        "-s", f"{width}x{height}",
+        "-r", str(fps),
+        "-i", "pipe:0",
+        "-c:v", codec,
+    ]
+
+    if codec == "hevc_nvenc":
+        cmd.extend(["-preset", "p7", "-rc", "vbr", "-cq", str(crf)])
+    else:
+        cmd.extend(["-preset", preset, "-crf", str(crf)])
+
+    cmd.extend(["-pix_fmt", "yuv420p", "-v", "error", output_path])
+    return cmd
+
+
+def build_encode_pipe_vp9_cmd(
+    fps: float,
+    width: int,
+    height: int,
+    crf: int,
+    output_path: str,
+    speed: int = 4,
+) -> List[str]:
+    """Build ffmpeg command to encode raw BGRA bytes from stdin to VP9 WebM with alpha.
+
+    Input: raw BGRA from pipe:0 (4 bytes/pixel).
+    """
+    return [
+        "ffmpeg", "-nostdin", "-y",
+        "-f", "rawvideo",
+        "-pix_fmt", "bgra",
+        "-s", f"{width}x{height}",
+        "-r", str(fps),
+        "-i", "pipe:0",
+        "-c:v", "libvpx-vp9",
+        "-pix_fmt", "yuva420p",
+        "-crf", str(crf),
+        "-b:v", "0",
+        "-auto-alt-ref", "0",
+        "-row-mt", "1",
+        "-speed", str(speed),
+        "-v", "error",
+        output_path,
+    ]
+
+
 def run_ffmpeg(cmd: List[str], timeout: int = 7200) -> subprocess.CompletedProcess:
     """Run an ffmpeg command, capturing output. Raises on failure."""
     logger.info("Running: %s", " ".join(cmd))

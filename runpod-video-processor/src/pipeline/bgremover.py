@@ -32,6 +32,7 @@ from src.config import (
     DEFAULT_RVM_BATCH_SIZE,
     DEFAULT_VP9_CRF,
     SEGMENT_SIZE,
+    TEMP_DIR,
 )
 from src.pipeline.detector import VRLayout
 from src.pipeline.encoder import encode_segment_vp9, concatenate_segments, mux_audio_webm
@@ -43,9 +44,18 @@ from src.storage.volume import (
     estimate_segment_disk_gb,
 )
 from src.utils.ffmpeg import (
+    build_decode_pipe_cmd,
+    build_encode_pipe_vp9_cmd,
     build_extract_frames_cmd,
     get_video_metadata,
     run_ffmpeg,
+)
+from src.utils.streaming import (
+    close_process,
+    read_frames,
+    start_decode_process,
+    start_encode_process,
+    write_frame,
 )
 
 logger = logging.getLogger(__name__)
@@ -403,3 +413,182 @@ def _process_vr_batch(
         merged.append(_merge_vr_frame(left_bgra, right_bgra, layout))
 
     return merged
+
+
+def process_video_streaming(
+    input_path: str,
+    output_path: str,
+    model_name: str = DEFAULT_RVM_MODEL,
+    downsample_ratio: float = DEFAULT_DOWNSAMPLE_RATIO,
+    batch_size: int = DEFAULT_RVM_BATCH_SIZE,
+    crf: int = DEFAULT_VP9_CRF,
+    layout: VRLayout = VRLayout.FLAT_2D,
+    device: str = "cuda:0",
+    segment_size: int = SEGMENT_SIZE,
+    progress_callback: Optional[Callable[[Dict], None]] = None,
+) -> Dict:
+    """Run background removal using FFmpeg pipe streaming (no PNG disk I/O).
+
+    Same interface as process_video() but reads/writes raw frames via pipes.
+    Batch-reads frames from decode pipe, processes through RVM, writes BGRA to
+    VP9 encode pipe.
+    """
+    from src.pipeline.encoder import concatenate_segments, mux_audio_webm
+
+    job_id = str(uuid.uuid4())[:8]
+    start_time = time.time()
+    segment_clips: List[str] = []
+
+    try:
+        # --- Get video metadata ---
+        meta = get_video_metadata(input_path)
+        total_frames = meta["num_frames"]
+        fps = meta["fps"]
+        in_w, in_h = meta["width"], meta["height"]
+        out_w, out_h = in_w, in_h
+
+        logger.info(
+            "Streaming BG removal: %s (%dx%d, %d frames, %s layout, job=%s)",
+            input_path, in_w, in_h, total_frames, layout.value, job_id,
+        )
+
+        # --- Estimate disk space (streaming: only encoded segments) ---
+        needed_gb = max(2.0, (total_frames / segment_size) * 1.0)
+        if not check_disk_space(needed_gb):
+            raise BgRemoveError(f"Insufficient disk space: need ~{needed_gb:.1f} GB free")
+
+        # --- Load RVM model(s) ---
+        is_vr = layout in (VRLayout.SBS, VRLayout.OU)
+        if is_vr:
+            processor_left = RVMProcessor(model_name, device, downsample_ratio)
+            processor_right = RVMProcessor(model_name, device, downsample_ratio)
+        else:
+            processor = RVMProcessor(model_name, device, downsample_ratio)
+
+        effective_batch = batch_size
+
+        # --- Process segments ---
+        num_segments = (total_frames + segment_size - 1) // segment_size
+        frames_processed = 0
+        job_dir = TEMP_DIR / job_id
+        job_dir.mkdir(parents=True, exist_ok=True)
+
+        for seg_idx in range(num_segments):
+            seg_start = seg_idx * segment_size
+            seg_frames = min(segment_size, total_frames - seg_start)
+
+            seg_clip_path = str(job_dir / f"segment_{seg_idx:04d}.webm")
+
+            if progress_callback:
+                progress_callback({
+                    "stage": "removing_background",
+                    "segment": seg_idx + 1,
+                    "total_segments": num_segments,
+                    "frame": frames_processed,
+                    "total_frames": total_frames,
+                })
+
+            # Start decode pipe
+            decode_cmd = build_decode_pipe_cmd(
+                input_path, seg_start, seg_frames, fps, in_w, in_h,
+            )
+            decode_proc = start_decode_process(decode_cmd)
+
+            # Start VP9 encode pipe (BGRA input for alpha)
+            encode_cmd = build_encode_pipe_vp9_cmd(
+                fps, out_w, out_h, crf, seg_clip_path,
+            )
+            encode_proc = start_encode_process(encode_cmd)
+
+            try:
+                remaining = seg_frames
+                while remaining > 0:
+                    read_count = min(effective_batch, remaining)
+                    batch_bgr = read_frames(decode_proc, in_w, in_h, read_count, channels=3)
+                    if not batch_bgr:
+                        break
+
+                    if is_vr:
+                        result_frames = _process_vr_batch(
+                            batch_bgr, layout, processor_left, processor_right,
+                            device, effective_batch,
+                        )
+                    else:
+                        result_frames, effective_batch = _process_batch_with_oom_retry(
+                            processor, batch_bgr, device, effective_batch,
+                        )
+
+                    for bgra_frame in result_frames:
+                        write_frame(encode_proc, bgra_frame)
+
+                    frames_processed += len(batch_bgr)
+                    remaining -= len(batch_bgr)
+
+                    if progress_callback:
+                        progress_callback({
+                            "stage": "removing_background",
+                            "segment": seg_idx + 1,
+                            "total_segments": num_segments,
+                            "frame": frames_processed,
+                            "total_frames": total_frames,
+                        })
+
+                    del batch_bgr, result_frames
+
+            finally:
+                close_process(decode_proc, "decode")
+                close_process(encode_proc, "encode")
+
+            segment_clips.append(seg_clip_path)
+            logger.info("Segment %d encoded via pipe", seg_idx)
+
+        # --- Concatenate segments ---
+        if progress_callback:
+            progress_callback({"stage": "concatenating", "frame": total_frames, "total_frames": total_frames})
+
+        video_only_path = str(job_dir / "video_only.webm")
+
+        if len(segment_clips) == 1:
+            os.rename(segment_clips[0], video_only_path)
+        else:
+            concatenate_segments(segment_clips, video_only_path, str(job_dir))
+
+        # --- Mux audio (Opus for WebM) ---
+        if progress_callback:
+            progress_callback({"stage": "muxing_audio", "frame": total_frames, "total_frames": total_frames})
+
+        mux_audio_webm(video_only_path, input_path, output_path)
+
+        elapsed = time.time() - start_time
+
+        result = {
+            "status": "success",
+            "input_path": input_path,
+            "output_path": output_path,
+            "input_resolution": f"{in_w}x{in_h}",
+            "output_resolution": f"{out_w}x{out_h}",
+            "total_frames": total_frames,
+            "layout": layout.value,
+            "model": model_name,
+            "batch_size": effective_batch,
+            "crf": crf,
+            "processing_time_sec": round(elapsed, 1),
+            "avg_fps": round(frames_processed / elapsed, 2) if elapsed > 0 else 0,
+            "streaming": True,
+        }
+
+        logger.info("Streaming BG removal complete: %s", result)
+        return result
+
+    except Exception as e:
+        elapsed = time.time() - start_time
+        logger.error("Streaming BG removal failed after %.1fs: %s", elapsed, e, exc_info=True)
+        return {
+            "status": "failed",
+            "error": str(e),
+            "input_path": input_path,
+            "processing_time_sec": round(elapsed, 1),
+        }
+
+    finally:
+        cleanup_job(job_id)
