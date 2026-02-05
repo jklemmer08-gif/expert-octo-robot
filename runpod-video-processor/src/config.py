@@ -27,6 +27,24 @@ MODEL_DIR = Path(os.getenv("MODEL_DIR", "/app/models"))
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "RealESRGAN_x4plus")
 SEGMENT_SIZE = int(os.getenv("SEGMENT_SIZE", "1000"))
 
+# --- Background Removal (RVM) ---
+DEFAULT_RVM_MODEL = os.getenv("DEFAULT_RVM_MODEL", "resnet50")
+DEFAULT_DOWNSAMPLE_RATIO = float(os.getenv("DEFAULT_DOWNSAMPLE_RATIO", "0.5"))
+DEFAULT_RVM_BATCH_SIZE = int(os.getenv("DEFAULT_RVM_BATCH_SIZE", "8"))
+RVM_MODEL_DIR = Path(os.getenv("RVM_MODEL_DIR", "/app/models/rvm"))
+DEFAULT_VP9_CRF = int(os.getenv("DEFAULT_VP9_CRF", "30"))
+
+AVAILABLE_RVM_MODELS = {
+    "resnet50": {
+        "file": "rvm_resnet50_fp32.torchscript",
+        "description": "ResNet50 (higher quality, slower)",
+    },
+    "mobilenetv3": {
+        "file": "rvm_mobilenetv3_fp32.torchscript",
+        "description": "MobileNetV3 (faster, lighter)",
+    },
+}
+
 # --- Device ---
 DEVICE = os.getenv("DEVICE", "cuda:0")
 GPU_ID = int(os.getenv("GPU_ID", "0"))

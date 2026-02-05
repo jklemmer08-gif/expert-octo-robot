@@ -11,16 +11,21 @@ from flask import Flask, Response, jsonify, render_template, request
 
 from src.config import (
     AVAILABLE_MODELS,
+    AVAILABLE_RVM_MODELS,
     DEFAULT_CRF,
+    DEFAULT_DOWNSAMPLE_RATIO,
     DEFAULT_MODEL,
+    DEFAULT_RVM_MODEL,
     DEFAULT_SCALE,
+    DEFAULT_VP9_CRF,
     INPUT_DIR,
     OUTPUT_DIR,
     WEB_PORT,
 )
 from src.gpu import detect_gpu, get_gpu_profile, get_vram_usage
 from src.pipeline.detector import VRLayout, detect_layout
-from src.pipeline.upscaler import process_video
+from src.pipeline.bgremover import process_video as bgremove_video
+from src.pipeline.upscaler import process_video as upscale_video
 from src.pipeline.validator import validate_input
 from src.storage.volume import (
     cleanup_orphaned_temp,
@@ -101,6 +106,7 @@ def api_system():
         "vram": vram,
         "disk": disk,
         "models": {k: v["description"] for k, v in AVAILABLE_MODELS.items()},
+        "rvm_models": {k: v["description"] for k, v in AVAILABLE_RVM_MODELS.items()},
     })
 
 
@@ -129,9 +135,7 @@ def api_process():
 
     data = request.get_json()
     input_path = data.get("input_path", "")
-    model_name = data.get("model", DEFAULT_MODEL)
-    scale = int(data.get("scale", DEFAULT_SCALE))
-    crf = int(data.get("crf", DEFAULT_CRF))
+    pipeline = data.get("pipeline", "upscale")
     layout_override = data.get("layout", "auto")
 
     # Validate
@@ -147,13 +151,22 @@ def api_process():
     else:
         layout = VRLayout(layout_override)
 
-    # Generate output path
-    input_name = Path(input_path).stem
-    output_name = f"{input_name}_upscaled_{scale}x.mkv"
-    output_path = str(OUTPUT_DIR / output_name)
-
     # Get profile
     profile = get_gpu_profile()
+
+    input_name = Path(input_path).stem
+
+    if pipeline == "bgremove":
+        rvm_model = data.get("rvm_model", DEFAULT_RVM_MODEL)
+        crf = int(data.get("crf", DEFAULT_VP9_CRF))
+        output_name = f"{input_name}_bgremoved.webm"
+        output_path = str(OUTPUT_DIR / output_name)
+    else:
+        model_name = data.get("model", DEFAULT_MODEL)
+        scale = int(data.get("scale", DEFAULT_SCALE))
+        crf = int(data.get("crf", DEFAULT_CRF))
+        output_name = f"{input_name}_upscaled_{scale}x.mkv"
+        output_path = str(OUTPUT_DIR / output_name)
 
     job_id = str(uuid.uuid4())[:8]
     progress_manager.create_job(job_id, total_frames=meta.get("num_frames", 0))
@@ -167,17 +180,30 @@ def api_process():
             _current_job_id = job_id
 
         try:
-            result = process_video(
-                input_path=input_path,
-                output_path=output_path,
-                model_name=model_name,
-                scale=scale,
-                tile_size=profile.tile_size,
-                crf=crf,
-                layout=layout,
-                segment_size=profile.segment_size,
-                progress_callback=progress_callback,
-            )
+            if pipeline == "bgremove":
+                result = bgremove_video(
+                    input_path=input_path,
+                    output_path=output_path,
+                    model_name=rvm_model,
+                    downsample_ratio=profile.rvm_downsample_ratio,
+                    batch_size=profile.rvm_batch_size,
+                    crf=crf,
+                    layout=layout,
+                    segment_size=profile.segment_size,
+                    progress_callback=progress_callback,
+                )
+            else:
+                result = upscale_video(
+                    input_path=input_path,
+                    output_path=output_path,
+                    model_name=model_name,
+                    scale=scale,
+                    tile_size=profile.tile_size,
+                    crf=crf,
+                    layout=layout,
+                    segment_size=profile.segment_size,
+                    progress_callback=progress_callback,
+                )
 
             if result["status"] == "success":
                 progress_manager.update(job_id, {"stage": "completed", "frame": meta.get("num_frames", 0)})
@@ -194,14 +220,20 @@ def api_process():
     thread = threading.Thread(target=run_job, daemon=True)
     thread.start()
 
-    return jsonify({
+    response = {
         "job_id": job_id,
         "output_path": output_path,
         "layout": layout.value,
-        "model": model_name,
-        "scale": scale,
+        "pipeline": pipeline,
         "crf": crf,
-    })
+    }
+    if pipeline == "bgremove":
+        response["rvm_model"] = rvm_model
+    else:
+        response["model"] = model_name
+        response["scale"] = scale
+
+    return jsonify(response)
 
 
 @app.route("/api/progress")

@@ -169,6 +169,54 @@ def build_concat_cmd(
     ]
 
 
+def build_encode_segment_vp9_cmd(
+    input_pattern: str,
+    output_path: str,
+    fps: float,
+    width: int,
+    height: int,
+    crf: int = 30,
+    speed: int = 4,
+) -> List[str]:
+    """Build ffmpeg command to encode RGBA PNGs into a VP9 WebM with alpha."""
+    return [
+        "ffmpeg", "-y",
+        "-framerate", str(fps),
+        "-i", input_pattern,
+        "-c:v", "libvpx-vp9",
+        "-pix_fmt", "yuva420p",
+        "-crf", str(crf),
+        "-b:v", "0",
+        "-auto-alt-ref", "0",
+        "-row-mt", "1",
+        "-speed", str(speed),
+        output_path,
+    ]
+
+
+def build_mux_audio_webm_cmd(
+    video_path: str,
+    audio_source_path: str,
+    output_path: str,
+    extra_flags: Optional[List[str]] = None,
+) -> List[str]:
+    """Mux audio from the original file into a WebM, transcoding to Opus."""
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", video_path,
+        "-i", audio_source_path,
+        "-map", "0:v",
+        "-map", "1:a",
+        "-c:v", "copy",
+        "-c:a", "libopus",
+        "-b:a", "128k",
+    ]
+    if extra_flags:
+        cmd.extend(extra_flags)
+    cmd.append(output_path)
+    return cmd
+
+
 def build_mux_audio_cmd(
     video_path: str,
     audio_source_path: str,
