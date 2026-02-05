@@ -22,7 +22,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     wget \
     rsync \
-    && rm -rf /var/lib/apt/lists/*
+    openssh-server \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /var/run/sshd
 
 # ============================================================
 # Python dependencies
@@ -80,4 +82,4 @@ RUN chmod +x /app/scripts/*.sh
 # ============================================================
 RUN python3 /app/scripts/verify_install.py
 
-CMD ["python3", "-u", "/app/src/app.py"]
+CMD ["/app/scripts/start.sh"]

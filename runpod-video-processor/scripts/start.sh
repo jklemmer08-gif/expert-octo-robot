@@ -4,6 +4,16 @@ set -euo pipefail
 
 echo "=== RunPod Video Processor ==="
 
+# SSH setup (RunPod injects PUBLIC_KEY env var)
+if [ -n "${PUBLIC_KEY:-}" ]; then
+    mkdir -p ~/.ssh
+    chmod 700 ~/.ssh
+    echo "$PUBLIC_KEY" >> ~/.ssh/authorized_keys
+    chmod 600 ~/.ssh/authorized_keys
+    service ssh start
+    echo "SSH server started"
+fi
+
 # Ensure workspace directories
 mkdir -p /workspace/input /workspace/output /workspace/temp
 
@@ -13,7 +23,7 @@ import torch
 if torch.cuda.is_available():
     for i in range(torch.cuda.device_count()):
         props = torch.cuda.get_device_properties(i)
-        print(f'GPU {i}: {props.name} ({props.total_mem / 1e9:.1f} GB VRAM)')
+        print(f'GPU {i}: {props.name} ({props.total_memory / 1e9:.1f} GB VRAM)')
 else:
     print('WARNING: No CUDA GPUs detected')
 " 2>/dev/null || echo "GPU detection failed"
