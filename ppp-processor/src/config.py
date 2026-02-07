@@ -126,7 +126,12 @@ class Settings(BaseSettings):
     def from_yaml(cls, config_path: Optional[Path] = None) -> "Settings":
         """Load settings from a YAML file, falling back to defaults."""
         if config_path is None:
-            config_path = Path(__file__).parent.parent / "config" / "settings.yaml"
+            import os
+            env_path = os.environ.get("PPP_CONFIG")
+            if env_path:
+                config_path = Path(env_path)
+            else:
+                config_path = Path(__file__).parent.parent / "config" / "settings.yaml"
 
         if not config_path.exists():
             return cls()
