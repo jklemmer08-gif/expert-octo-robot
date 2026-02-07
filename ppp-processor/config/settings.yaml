@@ -1,0 +1,151 @@
+# PPP Processor Configuration
+# ============================
+
+# Paths
+paths:
+  stash_url: "http://localhost:9999/graphql"
+  stash_api_key: ""  # Leave empty if not required
+  library_root: "/home/jtk1234/media-drive1/Media"
+  output_dir: "/mnt/ppp-work/ppp/output"
+  temp_dir: "/mnt/ppp-work/ppp/temp"
+  models_dir: "./bin/models"
+  realesrgan_bin: "./bin/realesrgan-ncnn-vulkan"
+  analysis_dir: "../ppp_analysis"
+
+# GPU Settings
+gpu:
+  device_id: 0
+  tile_size: 512  # Increase for faster processing, decrease if OOM
+  
+# Upscaling Settings
+upscale:
+  # Model choices: realesrgan-x4plus, realesrgan-x4plus-anime, realesr-animevideov3
+  default_model: "realesr-animevideov3"  # Best speed/quality for bulk
+  priority_model: "realesrgan-x4plus"     # Best quality for top content
+  scale_factor: 2  # 2x default
+  
+# Encoding Settings (Heresphere/DeoVR optimized)
+encode:
+  codec: "hevc"
+  encoder: "hevc_vaapi"  # Intel Arc hardware encoding
+  fallback_encoder: "libx265"  # Software fallback
+  
+  # Bitrate targets by output resolution
+  bitrates:
+    "8K": "150M"
+    "6K": "100M" 
+    "5K": "80M"
+    "4K": "50M"
+    "1080p": "15M"
+  
+  # Quality settings
+  crf: 20
+  preset: "medium"
+  
+# VR Detection Patterns
+vr_patterns:
+  - "_180"
+  - "_360"
+  - "_vr"
+  - "_VR"
+  - "_sbs"
+  - "_SBS"
+  - "_LR"
+  - "_TB"
+  - "_3dh"
+  - "_6k"
+  - "_6K"
+  - "_7k"
+  - "_8k"
+  - "_8K"
+  - "_fisheye"
+  - "POVR"
+  - "VRBangers"
+  - "WankzVR"
+  - "SLR"
+  - "VirtualReal"
+
+# Matting Settings (RVM)
+matting:
+  enabled: false  # Set true when RVM is installed
+  model: "mobilenetv3"  # or "resnet50" for higher quality
+  output_type: "green_screen"  # or "alpha_matte"
+  green_color: [0, 177, 64]  # Heresphere default chroma key color
+
+# Processing Tiers
+tiers:
+  tier1:
+    description: "Top priority - highest quality"
+    model: "realesrgan-x4plus"
+    target: "8K"
+    max_count: 40  # For $75 RunPod budget
+    
+  tier2:
+    description: "VR content for cloud"
+    model: "realesr-animevideov3"
+    target: "6K"
+    
+  tier3:
+    description: "Bulk local processing"
+    model: "realesr-animevideov3"
+    target: "auto"  # Based on source resolution
+
+# Stash Integration
+stash:
+  url: "http://localhost:9999/graphql"
+  api_key: ""  # Set via environment variable STASH_API_KEY
+  # Tags to add after processing
+  tags:
+    - "Upscaled"
+    - "PPP-Processed"
+
+# Jellyfin Integration  
+jellyfin:
+  url: "http://localhost:8096"
+  api_key: ""  # Set via environment variable JELLYFIN_API_KEY
+  library_path: ""  # e.g., /media/jellyfin/VR - leave empty to skip
+  # Organization structure
+  organize_by:
+    vr: "VR/"           # VR content goes here
+    studio: "Studios/"   # Organized by studio
+    default: "Unsorted/" # Fallback
+
+# RunPod Settings
+runpod:
+  api_key: ""  # Set via environment variable RUNPOD_API_KEY
+  template_id: ""
+  preferred_gpu: "NVIDIA RTX 4090"
+  fallback_gpu: "NVIDIA RTX 3090"
+  max_cost_per_job: 5.00
+  budget_total: 75.00
+
+# Redis (Celery broker)
+redis:
+  host: "localhost"
+  port: 6379
+  db: 0
+  password: ""  # Set via environment variable REDIS_PASSWORD
+
+# Library Watcher
+watcher:
+  enabled: false
+  scan_interval_hours: 6.0
+  scan_paths: []  # Additional paths to scan beyond library_root
+
+# QA Validation
+qa:
+  sample_duration: 15          # seconds
+  sample_start_percent: 0.4    # start at 40% of video
+  ssim_threshold: 0.85         # auto-approve if >=
+  psnr_threshold: 28.0         # auto-approve if >=
+  auto_approve_tolerance: 0.10 # within 10% of threshold -> human review
+  cleanup_approved_days: 7     # delete approved samples after N days
+  cleanup_rejected_days: 30    # delete rejected samples after N days
+
+# Tdarr Integration (Optional)
+tdarr:
+  enabled: false
+  url: "http://localhost:8265"
+  # Output raw frames for Tdarr to encode
+  output_frames_only: false
+  watch_folder: ""  # Tdarr will pick up files from here

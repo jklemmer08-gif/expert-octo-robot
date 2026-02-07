@@ -1,0 +1,28 @@
+{
+  "analysis_date": "2026-02-01T13:03:14.059602",
+  "total_scenes": 2692,
+  "vr_count": 396,
+  "2d_count": 2296,
+  "by_resolution": {
+    "1080p": 1476,
+    "6K": 70,
+    "4K": 497,
+    "720p": 192,
+    "5K": 23,
+    "1440p": 84,
+    "8K+": 56,
+    "SD": 294
+  },
+  "tier_counts": {
+    "tier1_topaz": 316,
+    "tier2_runpod": 70,
+    "tier3_local": 2065,
+    "skip": 557
+  },
+  "missing_metadata_count": 0,
+  "processing_estimates": {
+    "tier1_hours_local": 300,
+    "tier2_cost_runpod": 245.0,
+    "tier3_hours_local": 10325
+  }
+}
