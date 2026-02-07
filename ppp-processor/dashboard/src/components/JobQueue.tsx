@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { api, Job } from '../api/client'
 
 const STATUS_COLORS: Record<string, string> = {

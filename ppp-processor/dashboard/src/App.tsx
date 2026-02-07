@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { JobQueue } from './components/JobQueue'
 import { QAReview } from './components/QAReview'
 import { WorkerStatus } from './components/WorkerStatus'

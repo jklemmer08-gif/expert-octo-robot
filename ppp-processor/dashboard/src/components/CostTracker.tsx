@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { api, SystemStatus } from '../api/client'
 
 const BUDGET_TOTAL = 75.0
