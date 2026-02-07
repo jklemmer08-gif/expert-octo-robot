@@ -1,0 +1,64 @@
+# Local dev overrides — writable paths for testing
+# Usage: PPP_CONFIG=config/settings.local.yaml python -m uvicorn src.main:app
+
+paths:
+  stash_url: "http://localhost:9999/graphql"
+  stash_api_key: ""
+  library_root: "./work"
+  output_dir: "./work/output"
+  temp_dir: "./work/temp"
+  models_dir: "./bin/models"
+  realesrgan_bin: "./bin/realesrgan-ncnn-vulkan"
+  analysis_dir: "../ppp_analysis"
+
+gpu:
+  device_id: 0
+  tile_size: 512
+
+upscale:
+  default_model: "realesr-animevideov3"
+  priority_model: "realesrgan-x4plus"
+  scale_factor: 2
+
+encode:
+  codec: "hevc"
+  encoder: "hevc_vaapi"
+  fallback_encoder: "libx265"
+  bitrates:
+    "8K": "150M"
+    "6K": "100M"
+    "5K": "80M"
+    "4K": "50M"
+    "1080p": "15M"
+  crf: 20
+  preset: "medium"
+
+vr_patterns:
+  - "_180"
+  - "_360"
+  - "_vr"
+  - "_VR"
+  - "_sbs"
+  - "_SBS"
+  - "_LR"
+  - "_TB"
+
+redis:
+  host: "localhost"
+  port: 6379
+  db: 0
+  password: ""
+
+watcher:
+  enabled: false
+  scan_interval_hours: 6.0
+  scan_paths: []
+
+qa:
+  sample_duration: 15
+  sample_start_percent: 0.4
+  ssim_threshold: 0.85
+  psnr_threshold: 28.0
+  auto_approve_tolerance: 0.10
+  cleanup_approved_days: 7
+  cleanup_rejected_days: 30
