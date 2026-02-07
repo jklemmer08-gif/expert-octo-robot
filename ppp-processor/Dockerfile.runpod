@@ -1,0 +1,31 @@
+FROM nvidia/cuda:12.1.0-runtime-ubuntu22.04
+
+# System dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    python3 \
+    python3-pip \
+    wget \
+    unzip \
+    && rm -rf /var/lib/apt/lists/*
+
+# Real-ESRGAN binary
+RUN wget -q https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesrgan-ncnn-vulkan-20220424-ubuntu.zip \
+    && unzip -q realesrgan-ncnn-vulkan*.zip -d /opt/realesrgan \
+    && chmod +x /opt/realesrgan/realesrgan-ncnn-vulkan \
+    && rm realesrgan-ncnn-vulkan*.zip
+
+# Python dependencies
+WORKDIR /app
+COPY requirements.txt .
+RUN pip3 install --no-cache-dir -r requirements.txt
+
+# Application code
+COPY src/ src/
+COPY config/ config/
+
+ENV REALESRGAN_BIN=/opt/realesrgan/realesrgan-ncnn-vulkan
+ENV PYTHONPATH=/app
+
+# Celery worker entrypoint
+CMD ["celery", "-A", "src.celery_app", "worker", "-Q", "cloud", "--loglevel=info", "--concurrency=1"]
