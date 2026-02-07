@@ -78,3 +78,22 @@ def sample_vr_job():
         "status": "pending",
         "priority": 50,
     }
+
+
+@pytest.fixture
+def sample_matte_job():
+    """A matte/chroma-key job dict for testing."""
+    return {
+        "id": "test-job-matte-001",
+        "scene_id": "scene-pov-1",
+        "title": "POV Test Video",
+        "source_path": "/tmp/test_pov.mp4",
+        "output_path": "/tmp/test_pov_matted.mp4",
+        "tier": "matte",
+        "model": None,
+        "scale": None,
+        "is_vr": False,
+        "matte": True,
+        "status": "pending",
+        "priority": 5,
+    }

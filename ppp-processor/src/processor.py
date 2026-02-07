@@ -24,6 +24,21 @@ from PIL import Image
 from src.config import Settings
 from src.models.schemas import ContentType, ProcessingPlan, VideoInfo
 
+# Lazy torch import — only needed for matting
+_torch = None
+_transforms = None
+_np = None
+
+
+def _import_torch():
+    """Lazy import of PyTorch + torchvision + numpy for matting."""
+    global _torch, _transforms, _np
+    if _torch is None:
+        import torch as _torch
+        import torchvision.transforms as _transforms
+        import numpy as _np
+    return _torch, _transforms, _np
+
 logger = logging.getLogger("ppp.processor")
 
 ProgressCallback = Optional[Callable[[str, float], None]]
@@ -472,6 +487,271 @@ class VRMetadataPreserver:
         if new_path != video_path:
             video_path.rename(new_path)
         return new_path
+
+
+# ---------------------------------------------------------------------------
+# Matte Processor — background removal via RobustVideoMatting
+# ---------------------------------------------------------------------------
+class MatteProcessor:
+    """Background removal using RobustVideoMatting (refactored from matte.py).
+
+    Produces green-screen output suitable for Heresphere chroma key passthrough.
+    Requires PyTorch + torchvision. Works best with CUDA (RTX 3060 Ti / 4090).
+    """
+
+    RVM_WEIGHTS = {
+        "mobilenetv3": "https://github.com/PeterL1n/RobustVideoMatting/releases/download/v1.0.0/rvm_mobilenetv3.pth",
+        "resnet50": "https://github.com/PeterL1n/RobustVideoMatting/releases/download/v1.0.0/rvm_resnet50.pth",
+    }
+
+    def __init__(self, settings: Settings):
+        self.settings = settings
+        self.models_dir = Path(settings.paths.models_dir)
+        self.model = None
+        self.device = None
+
+    def _ensure_model(self, model_type: str = "mobilenetv3") -> Path:
+        """Download RVM weights if not present."""
+        model_path = self.models_dir / f"rvm_{model_type}.pth"
+        if model_path.exists():
+            return model_path
+
+        url = self.RVM_WEIGHTS.get(model_type)
+        if not url:
+            raise ValueError(f"Unknown RVM model type: {model_type}")
+
+        self.models_dir.mkdir(parents=True, exist_ok=True)
+        logger.info("Downloading RVM %s model...", model_type)
+        subprocess.run(
+            ["wget", "-q", "--show-progress", "-O", str(model_path), url],
+            check=True,
+        )
+        return model_path
+
+    def _load_model(self, model_type: str = "mobilenetv3"):
+        """Load RVM model onto best available device."""
+        torch, transforms, np = _import_torch()
+
+        model_path = self._ensure_model(model_type)
+
+        if torch.cuda.is_available():
+            self.device = torch.device("cuda")
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            self.device = torch.device("mps")
+        else:
+            self.device = torch.device("cpu")
+
+        logger.info("Loading RVM on device: %s", self.device)
+
+        # Import the MattingNetwork from RVM repo (must be cloned)
+        import sys as _sys
+        rvm_path = self.models_dir.parent / "RobustVideoMatting"
+        if rvm_path.exists() and str(rvm_path) not in _sys.path:
+            _sys.path.insert(0, str(rvm_path))
+
+        from model import MattingNetwork  # type: ignore[import-untyped]
+
+        self.model = MattingNetwork(model_type).eval()
+        self.model.load_state_dict(torch.load(model_path, map_location=self.device))
+        self.model = self.model.to(self.device)
+
+    def matte_frames(
+        self,
+        input_dir: Path,
+        matted_dir: Path,
+        green_color: tuple = (0, 177, 64),
+        model_type: str = "mobilenetv3",
+        downsample_ratio: float = 0.25,
+        progress_callback: ProgressCallback = None,
+    ) -> bool:
+        """Run RVM on all frames in input_dir → green-screen composites in matted_dir."""
+        torch, transforms, np = _import_torch()
+
+        matted_dir.mkdir(parents=True, exist_ok=True)
+
+        if self.model is None:
+            self._load_model(model_type)
+
+        transform = transforms.Compose([transforms.ToTensor()])
+        frames = sorted(input_dir.glob("frame_*.png"))
+        total = len(frames)
+        logger.info("Matting %d frames with RVM (%s)", total, model_type)
+
+        rec = [None] * 4
+
+        with torch.no_grad():
+            for i, frame_path in enumerate(frames):
+                img = Image.open(frame_path).convert("RGB")
+                src = transform(img).unsqueeze(0).to(self.device)
+
+                fgr, pha, *rec = self.model(src, *rec, downsample_ratio)
+
+                # Build green-screen composite
+                alpha_np = (pha[0, 0].cpu().numpy() * 255).astype(np.uint8)
+                alpha_img = Image.fromarray(alpha_np, mode="L")
+
+                frame_rgba = img.convert("RGBA")
+                frame_rgba.putalpha(alpha_img)
+                green_bg = Image.new("RGBA", img.size, (*green_color, 255))
+                result = Image.alpha_composite(green_bg, frame_rgba)
+                result.convert("RGB").save(matted_dir / frame_path.name)
+
+                if progress_callback and (i + 1) % 50 == 0:
+                    pct = (i + 1) / total * 100
+                    progress_callback("matting", pct)
+
+                if (i + 1) % 100 == 0:
+                    logger.info("  Matted %d/%d frames", i + 1, total)
+
+        logger.info("Matting complete: %d frames", total)
+        return True
+
+    def process_video(
+        self,
+        input_path: Path,
+        output_path: Path,
+        info: VideoInfo,
+        progress_callback: ProgressCallback = None,
+    ) -> bool:
+        """Full matting pipeline for a 2D video."""
+        logger.info("Matting video: %s", input_path.name)
+        mc = self.settings.matte
+
+        temp_dir = Path(self.settings.paths.temp_dir)
+        work_dir = temp_dir / f"matte_{input_path.stem}"
+        work_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            if progress_callback:
+                progress_callback("extracting", 5)
+
+            frames_dir = work_dir / "frames"
+            extractor = FrameExtractor()
+            extractor.extract(input_path, frames_dir, fps=info.fps)
+
+            if progress_callback:
+                progress_callback("matting", 10)
+
+            matted_dir = work_dir / "matted"
+            green = tuple(mc.green_color)
+            success = self.matte_frames(
+                frames_dir, matted_dir,
+                green_color=green,
+                model_type=mc.model_type,
+                downsample_ratio=mc.downsample_ratio,
+                progress_callback=progress_callback,
+            )
+
+            if not success:
+                return False
+
+            if progress_callback:
+                progress_callback("encoding", 90)
+
+            encoder = Encoder(self.settings)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            success = encoder.encode(
+                matted_dir, output_path, info.fps,
+                audio_source=input_path,
+                bitrate="15M",
+            )
+
+            if progress_callback:
+                progress_callback("complete" if success else "failed", 100 if success else 0)
+
+            return success
+
+        finally:
+            if work_dir.exists():
+                logger.info("Cleaning up matte temp files: %s", work_dir)
+                shutil.rmtree(work_dir)
+
+    def process_vr_sbs(
+        self,
+        input_path: Path,
+        output_path: Path,
+        info: VideoInfo,
+        progress_callback: ProgressCallback = None,
+    ) -> bool:
+        """Matte VR SBS video — process each eye independently for temporal consistency."""
+        logger.info("Matting VR SBS: %s", input_path.name)
+        mc = self.settings.matte
+
+        temp_dir = Path(self.settings.paths.temp_dir)
+        work_dir = temp_dir / f"matte_vr_{input_path.stem}"
+        work_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            extractor = FrameExtractor()
+            vr_proc = VRProcessor()
+
+            if progress_callback:
+                progress_callback("extracting", 5)
+
+            frames_dir = work_dir / "frames"
+            extractor.extract(input_path, frames_dir, fps=info.fps)
+
+            if progress_callback:
+                progress_callback("splitting", 10)
+
+            left_dir = work_dir / "left"
+            right_dir = work_dir / "right"
+            vr_proc.split_sbs(frames_dir, left_dir, right_dir)
+
+            # Matte left eye
+            if progress_callback:
+                progress_callback("matting_left", 15)
+
+            left_matted = work_dir / "left_matted"
+            green = tuple(mc.green_color)
+            self.matte_frames(
+                left_dir, left_matted,
+                green_color=green,
+                model_type=mc.model_type,
+                downsample_ratio=mc.downsample_ratio,
+            )
+
+            # Reset recurrent state for right eye
+            self.model = None  # Force re-init for clean temporal state
+
+            if progress_callback:
+                progress_callback("matting_right", 50)
+
+            right_matted = work_dir / "right_matted"
+            self.matte_frames(
+                right_dir, right_matted,
+                green_color=green,
+                model_type=mc.model_type,
+                downsample_ratio=mc.downsample_ratio,
+            )
+
+            # Merge back to SBS
+            if progress_callback:
+                progress_callback("merging", 85)
+
+            merged_dir = work_dir / "merged"
+            vr_proc.merge_sbs(left_matted, right_matted, merged_dir)
+
+            if progress_callback:
+                progress_callback("encoding", 90)
+
+            encoder = Encoder(self.settings)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            success = encoder.encode(
+                merged_dir, output_path, info.fps,
+                audio_source=input_path,
+                bitrate="50M",
+            )
+
+            if progress_callback:
+                progress_callback("complete" if success else "failed", 100 if success else 0)
+
+            return success
+
+        finally:
+            if work_dir.exists():
+                logger.info("Cleaning up VR matte temp files: %s", work_dir)
+                shutil.rmtree(work_dir)
 
 
 # ---------------------------------------------------------------------------

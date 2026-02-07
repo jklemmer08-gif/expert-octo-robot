@@ -102,3 +102,19 @@ def test_worker_status():
 def test_content_type_enum():
     assert ContentType.VR_SBS == "vr_sbs"
     assert ContentType.FLAT_2D == "flat_2d"
+
+
+def test_job_create_matte():
+    job = JobCreate(source_path="/path/pov_scene.mp4", matte=True)
+    assert job.matte is True
+    assert job.tier == "tier3"
+
+
+def test_job_create_matte_default():
+    job = JobCreate(source_path="/path/video.mp4")
+    assert job.matte is False
+
+
+def test_job_response_matte():
+    r = JobResponse(id="abc", source_path="/path/video.mp4", matte=True)
+    assert r.matte is True

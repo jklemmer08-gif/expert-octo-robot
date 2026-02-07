@@ -41,6 +41,7 @@ class JobDatabase:
                 model TEXT,
                 scale INTEGER,
                 is_vr INTEGER DEFAULT 0,
+                matte INTEGER DEFAULT 0,
                 status TEXT DEFAULT 'pending',
                 priority INTEGER DEFAULT 0,
                 created_at TEXT,
@@ -109,6 +110,16 @@ class JobDatabase:
             CREATE INDEX IF NOT EXISTS idx_qa_job_id ON qa_samples(job_id);
         """)
         self.conn.commit()
+        # Migrate: add matte column to existing databases
+        self._migrate()
+
+    def _migrate(self):
+        """Add columns that may be missing in older databases."""
+        try:
+            self.conn.execute("SELECT matte FROM jobs LIMIT 1")
+        except sqlite3.OperationalError:
+            self.conn.execute("ALTER TABLE jobs ADD COLUMN matte INTEGER DEFAULT 0")
+            self.conn.commit()
 
     # ------------------------------------------------------------------
     # Job CRUD (preserved from batch_process.py + extensions)
@@ -120,8 +131,8 @@ class JobDatabase:
             cursor = self.conn.execute("""
                 INSERT OR IGNORE INTO jobs
                 (id, scene_id, title, source_path, output_path, tier, model,
-                 scale, is_vr, status, priority, created_at, file_hash)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 scale, is_vr, matte, status, priority, created_at, file_hash)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 job_id,
                 job.get("scene_id"),
@@ -132,6 +143,7 @@ class JobDatabase:
                 job.get("model"),
                 job.get("scale"),
                 int(job.get("is_vr", False)),
+                int(job.get("matte", False)),
                 job.get("status", "pending"),
                 job.get("priority", 0),
                 job.get("created_at") or datetime.now().isoformat(),
