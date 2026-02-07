@@ -138,3 +138,27 @@ class TestWorkerEndpoints:
         resp = client.get("/workers")
         assert resp.status_code == 200
         assert len(resp.json()) == 1
+
+
+class TestMatteEndpoints:
+
+    @patch("src.main.local_task", create=True)
+    def test_create_matte_job(self, mock_task, client):
+        resp = client.post("/jobs", json={
+            "source_path": "/tmp/pov_scene.mp4",
+            "matte": True,
+        })
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["matte"] is True
+        assert "_matted" in data["output_path"]
+
+    @patch("src.main.local_task", create=True)
+    def test_create_normal_job_no_matte(self, mock_task, client):
+        resp = client.post("/jobs", json={
+            "source_path": "/tmp/normal.mp4",
+        })
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["matte"] is False
+        assert "_matted" not in data["output_path"]

@@ -89,6 +89,14 @@ class WatcherConfig(BaseSettings):
     scan_paths: List[str] = Field(default_factory=list)
 
 
+class MatteConfig(BaseSettings):
+    """Background matting / chroma key settings."""
+    model_type: str = "mobilenetv3"  # "mobilenetv3" or "resnet50"
+    downsample_ratio: float = 0.25  # Lower = faster, less accurate edges
+    green_color: List[int] = Field(default_factory=lambda: [0, 177, 64])  # Heresphere default
+    output_type: str = "green_screen"  # "green_screen" or "alpha_matte"
+
+
 class QAConfig(BaseSettings):
     sample_duration: int = 15
     sample_start_percent: float = 0.4
@@ -120,6 +128,7 @@ class Settings(BaseSettings):
     redis: RedisConfig = Field(default_factory=RedisConfig)
     watcher: WatcherConfig = Field(default_factory=WatcherConfig)
     qa: QAConfig = Field(default_factory=QAConfig)
+    matte: MatteConfig = Field(default_factory=MatteConfig)
     tiers: Dict[str, Any] = Field(default_factory=dict)
 
     @classmethod

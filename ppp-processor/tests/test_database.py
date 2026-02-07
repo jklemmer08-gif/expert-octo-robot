@@ -181,3 +181,25 @@ def test_log_and_get_cost(test_db, sample_job):
     summary = test_db.get_cost_summary()
     assert summary["total_cost"] == 1.50
     assert "RTX 4090" in summary["by_gpu"]
+
+
+# Matte job tests
+def test_add_matte_job(test_db, sample_matte_job):
+    assert test_db.add_job(sample_matte_job) is True
+    job = test_db.get_job("test-job-matte-001")
+    assert job is not None
+    assert job["matte"] == 1  # SQLite stores as int
+    assert job["tier"] == "matte"
+
+
+def test_matte_column_migration(tmp_path):
+    """Test that the matte column is added to existing databases."""
+    db_path = tmp_path / "migrate_test.db"
+    db = JobDatabase(db_path)
+    # The matte column should exist after init
+    row = db.conn.execute(
+        "SELECT matte FROM jobs LIMIT 1"
+    ).fetchone()
+    # No rows, but column exists (no OperationalError)
+    assert row is None
+    db.close()

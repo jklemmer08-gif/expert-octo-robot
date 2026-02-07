@@ -96,6 +96,7 @@ class JobCreate(BaseModel):
     priority: int = 0
     scene_id: Optional[str] = None
     title: Optional[str] = None
+    matte: bool = False  # Enable background removal / chroma key
 
 
 class JobResponse(BaseModel):
@@ -109,6 +110,7 @@ class JobResponse(BaseModel):
     model: Optional[str] = None
     scale: Optional[int] = None
     is_vr: bool = False
+    matte: bool = False
     status: JobStatus = JobStatus.PENDING
     priority: int = 0
     created_at: Optional[datetime] = None

@@ -1,15 +1,15 @@
-# Local dev overrides — writable paths for testing
+# Production config — real library paths
 # Usage: PPP_CONFIG=config/settings.local.yaml python -m uvicorn src.main:app
 
 paths:
   stash_url: "http://localhost:9999/graphql"
   stash_api_key: ""
-  library_root: "./work"
-  output_dir: "./work/output"
-  temp_dir: "./work/temp"
-  models_dir: "./bin/models"
-  realesrgan_bin: "./bin/realesrgan-ncnn-vulkan"
-  analysis_dir: "../ppp_analysis"
+  library_root: "/home/jtk1234/media-drive1"
+  output_dir: "/home/jtk1234/media-drive2/ppp-output"
+  temp_dir: "/home/jtk1234/PPP Project Reset/ppp-processor/work/temp"
+  models_dir: "/home/jtk1234/PPP Project Reset/ppp-processor/bin/models"
+  realesrgan_bin: "/home/jtk1234/PPP Project Reset/ppp-processor/bin/realesrgan-ncnn-vulkan"
+  analysis_dir: "/home/jtk1234/PPP Project Reset/ppp_analysis"
 
 gpu:
   device_id: 0
@@ -62,3 +62,9 @@ qa:
   auto_approve_tolerance: 0.10
   cleanup_approved_days: 7
   cleanup_rejected_days: 30
+
+matte:
+  model_type: "mobilenetv3"
+  downsample_ratio: 0.25
+  green_color: [0, 177, 64]
+  output_type: "green_screen"

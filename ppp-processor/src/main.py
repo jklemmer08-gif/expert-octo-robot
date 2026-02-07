@@ -89,6 +89,11 @@ def create_job(job: JobCreate):
             / f"{source.stem}_upscaled_{job.scale or s.upscale.scale_factor}x.mp4"
         )
 
+    # Adjust output filename for matted jobs
+    if job.matte and output_path:
+        p = Path(output_path)
+        output_path = str(p.with_stem(p.stem + "_matted"))
+
     job_dict: Dict[str, Any] = {
         "id": job_id,
         "scene_id": job.scene_id,
@@ -99,6 +104,7 @@ def create_job(job: JobCreate):
         "model": job.model or s.upscale.default_model,
         "scale": job.scale or s.upscale.scale_factor,
         "is_vr": bool(job.force_vr) if job.force_vr is not None else False,
+        "matte": job.matte,
         "status": "pending",
         "priority": job.priority,
         "created_at": now,
@@ -255,6 +261,71 @@ def route_job(source_path: str, force_vr: Optional[bool] = None):
         return plan.model_dump()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Matte / Chroma Key
+# ---------------------------------------------------------------------------
+@app.post("/matte/batch")
+def matte_batch(
+    tag: str = Query("POV", description="Stash tag to filter for matting candidates"),
+    limit: int = Query(50, le=500),
+):
+    """Create matting jobs for 2D scenes matching a tag (e.g. POV)."""
+    db = get_db()
+    s = get_settings()
+
+    # Read analysis CSV to find POV-tagged scenes
+    analysis_dir = Path(s.paths.analysis_dir)
+    import csv
+
+    candidates = []
+    for csv_file in analysis_dir.glob("tier*_processing_list.csv"):
+        try:
+            with open(csv_file) as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    title = row.get("Title", "")
+                    tags = row.get("Tags", "")
+                    path = row.get("Path", "")
+                    if tag.lower() in tags.lower() and path:
+                        candidates.append(row)
+        except Exception:
+            continue
+
+    created = 0
+    for row in candidates[:limit]:
+        source_path = row.get("Path", "")
+        if not source_path or db.job_exists_for_path(source_path + "_matte"):
+            continue
+
+        source = Path(source_path)
+        output_path = str(
+            Path(s.paths.output_dir) / "matted"
+            / f"{source.stem}_matted.mp4"
+        )
+
+        job_id = str(uuid.uuid4())
+        job_dict = {
+            "id": job_id,
+            "scene_id": row.get("Scene ID", ""),
+            "title": row.get("Title", source.stem),
+            "source_path": source_path,
+            "output_path": output_path,
+            "tier": "matte",
+            "model": None,
+            "scale": None,
+            "is_vr": False,
+            "matte": True,
+            "status": "pending",
+            "priority": 5,
+            "created_at": datetime.now().isoformat(),
+        }
+
+        if db.add_job(job_dict):
+            created += 1
+
+    return {"status": "ok", "created": created, "candidates_found": len(candidates)}
 
 
 # ---------------------------------------------------------------------------

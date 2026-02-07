@@ -82,6 +82,46 @@ def process_job(self: LocalGPUTask, job_id: str):
             info.is_vr = True
             info.vr_type = "sbs"
 
+        # --- Matte-only job path ---
+        if job.get("matte"):
+            from src.processor import MatteProcessor
+
+            self.db.update_job_status(
+                job_id, JobStatus.PROCESSING.value,
+                worker_id=worker_id, current_stage="matting",
+            )
+
+            output_path = Path(job["output_path"])
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+
+            matte_proc = MatteProcessor(settings)
+            if info.is_vr and info.vr_type == "sbs":
+                success = matte_proc.process_vr_sbs(
+                    source_path, output_path, info, progress_callback,
+                )
+            else:
+                success = matte_proc.process_video(
+                    source_path, output_path, info, progress_callback,
+                )
+
+            processing_time = time.time() - start_time
+
+            if success and output_path.exists() and output_path.stat().st_size > 1024:
+                self.db.update_job_status(
+                    job_id, JobStatus.COMPLETED.value,
+                    processing_time=processing_time,
+                    progress=100, current_stage="complete",
+                )
+                logger.info("Matte job %s completed in %.1f min", job_id, processing_time / 60)
+                return {"status": "completed", "processing_time": processing_time}
+            else:
+                self.db.update_job_status(
+                    job_id, JobStatus.FAILED.value,
+                    error="Matting pipeline failed",
+                    processing_time=processing_time,
+                )
+                return {"status": "failed"}
+
         # Generate processing plan
         router = Router(settings)
         plan = router.plan(info, target_scale=job.get("scale"))
