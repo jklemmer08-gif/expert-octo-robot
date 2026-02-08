@@ -97,3 +97,22 @@ def sample_matte_job():
         "status": "pending",
         "priority": 5,
     }
+
+
+@pytest.fixture
+def sample_upscale_job():
+    """An upscale-only job dict for testing."""
+    return {
+        "id": "test-job-upscale-001",
+        "scene_id": "scene-up-1",
+        "title": "Matted Video To Upscale",
+        "source_path": "/tmp/test_matted.mp4",
+        "output_path": "/tmp/test_upscaled.mp4",
+        "tier": "tier3",
+        "model": "realesr-animevideov3",
+        "scale": 2,
+        "is_vr": False,
+        "upscale": True,
+        "status": "pending",
+        "priority": 10,
+    }

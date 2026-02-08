@@ -55,3 +55,39 @@ def test_qa_config_defaults():
     s = Settings()
     assert s.qa.sample_duration == 15
     assert s.qa.cleanup_approved_days == 7
+
+
+def test_encode_nvenc_defaults():
+    """NVENC-specific encode config fields have correct defaults."""
+    s = Settings()
+    assert s.encode.encoder == "hevc_nvenc"
+    assert s.encode.fallback_encoder == "libx265"
+    assert s.encode.qp == 20
+    assert s.encode.nvenc_preset == "p5"
+    assert s.encode.tune == "hq"
+    assert s.encode.rc_mode == "constqp"
+    assert s.encode.spatial_aq is True
+    assert s.encode.temporal_aq is True
+    assert s.encode.rc_lookahead == 32
+    assert s.encode.profile == "main10"
+
+
+def test_tensorrt_config_defaults():
+    """TensorRT config fields have correct defaults."""
+    s = Settings()
+    assert s.tensorrt.enabled is False
+    assert s.tensorrt.fp16 is True
+    assert s.tensorrt.max_workspace_mb == 4096
+    assert len(s.tensorrt.resolution_buckets) == 5
+    bucket_names = [b["name"] for b in s.tensorrt.resolution_buckets]
+    assert "720p" in bucket_names
+    assert "1080p" in bucket_names
+    assert "4k" in bucket_names
+    assert "vr" in bucket_names
+
+
+def test_tensorrt_config_in_settings():
+    """TensorRT config is accessible from root Settings."""
+    s = Settings()
+    assert hasattr(s, "tensorrt")
+    assert s.tensorrt.cache_dir == "./trt_engines"

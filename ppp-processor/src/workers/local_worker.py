@@ -124,6 +124,59 @@ def process_job(self: LocalGPUTask, job_id: str):
                 )
                 return {"status": "failed"}
 
+        # --- Upscale-only job path ---
+        if job.get("upscale"):
+            from src.processor import Encoder, ProcessingPipeline, UpscaleEngine
+            from src.models.schemas import ContentType, ProcessingPlan
+
+            self.db.update_job_status(
+                job_id, JobStatus.PROCESSING.value,
+                worker_id=worker_id, current_stage="upscaling",
+            )
+
+            output_path = Path(platform_path(job["output_path"]))
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+
+            scale = job.get("scale") or settings.upscale.scale_factor
+            model = job.get("model") or settings.upscale.default_model
+            bitrate = settings.encode.bitrates.get("4K", "50M")
+
+            plan = ProcessingPlan(
+                model=model,
+                scale=scale,
+                worker_type="local",
+                bitrate=bitrate,
+                encoder=settings.encode.encoder if settings.encode.encoder != "hevc_vaapi" else settings.encode.fallback_encoder,
+                content_type=info.content_type,
+                tile_size=settings.gpu.tile_size,
+                gpu_id=settings.gpu.device_id,
+            )
+
+            pipeline = ProcessingPipeline(settings)
+
+            if info.is_vr and info.vr_type == "sbs":
+                success = pipeline.run(source_path, output_path, plan, info, progress_callback)
+            else:
+                success = pipeline.run(source_path, output_path, plan, info, progress_callback)
+
+            processing_time = time.time() - start_time
+
+            if success and output_path.exists() and output_path.stat().st_size > 1024:
+                self.db.update_job_status(
+                    job_id, JobStatus.COMPLETED.value,
+                    processing_time=processing_time,
+                    progress=100, current_stage="complete",
+                )
+                logger.info("Upscale job %s completed in %.1f min", job_id, processing_time / 60)
+                return {"status": "completed", "processing_time": processing_time}
+            else:
+                self.db.update_job_status(
+                    job_id, JobStatus.FAILED.value,
+                    error="Upscale pipeline failed",
+                    processing_time=processing_time,
+                )
+                return {"status": "failed"}
+
         # Generate processing plan
         router = Router(settings)
         plan = router.plan(info, target_scale=job.get("scale"))
