@@ -1,0 +1,38 @@
+paths:
+  stash_url: "http://10.0.0.93:9999/graphql"
+  stash_api_key: ""
+  library_root: "M:\\"
+  output_dir: "N:\\ppp-output"
+  temp_dir: "N:\\ppp-output\\work\\temp"
+  models_dir: "C:\\ppp-processor\\ppp-processor\\bin\\models"
+  realesrgan_bin: "C:\\ppp-processor\\ppp-processor\\bin\\realesrgan-ncnn-vulkan.exe"
+  analysis_dir: "C:\\ppp-processor\\ppp-processor\\ppp_analysis"
+
+path_maps:
+  - linux: "/home/jtk1234/media-drive1"
+    windows: "M:\\"
+  - linux: "/home/jtk1234/media-drive2"
+    windows: "N:\\"
+
+redis:
+  host: "10.0.0.93"
+  port: 6379
+  db: 0
+  password: ""
+
+matte:
+  model_type: "mobilenetv3"
+  downsample_ratio: 0.25
+  green_color: [0, 177, 64]
+  output_type: "green_screen"
+
+encode:
+  codec: "hevc"
+  encoder: "hevc_nvenc"
+  fallback_encoder: "libx265"
+  crf: 18
+  preset: "medium"
+  qp: 20
+  nvenc_preset: "p5"
+  tune: "hq"
+  rc_mode: "constqp"
