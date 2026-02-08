@@ -929,6 +929,18 @@ class MatteProcessor:
             extra_input_args=audio_args,
         )
 
+        def _read_with_timeout(pipe, nbytes, timeout=5):
+            """Read from pipe with a timeout to avoid hanging on network I/O."""
+            result = [None]
+            def _read():
+                result[0] = pipe.read(nbytes)
+            t = threading.Thread(target=_read, daemon=True)
+            t.start()
+            t.join(timeout=timeout)
+            if t.is_alive():
+                return None  # Timed out
+            return result[0]
+
         # If NVDEC decode fails, retry without hardware accel
         decoder = None
         nvdec_failed = False
@@ -937,8 +949,8 @@ class MatteProcessor:
                 decode_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 bufsize=pipe_bufsize,
             )
-            # Test first frame
-            test_raw = decoder.stdout.read(frame_bytes)
+            # Test first frame (with timeout to avoid hanging on network files)
+            test_raw = _read_with_timeout(decoder.stdout, frame_bytes, timeout=5)
             if not test_raw or len(test_raw) < frame_bytes:
                 decoder.kill()
                 decoder.wait()
@@ -962,7 +974,7 @@ class MatteProcessor:
                 decode_cmd_cpu, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 bufsize=pipe_bufsize,
             )
-            test_raw = decoder.stdout.read(frame_bytes)
+            test_raw = _read_with_timeout(decoder.stdout, frame_bytes, timeout=5)
             if not test_raw or len(test_raw) < frame_bytes:
                 logger.error("CPU decode also failed")
                 decoder.kill()
