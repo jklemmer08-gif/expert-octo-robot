@@ -48,15 +48,17 @@ def process_job(self: LocalGPUTask, job_id: str):
     from src.qa_validator import QAValidator
     from src.router import Router
 
+    from src.utils import platform_path
+
     job = self.db.get_job(job_id)
     if not job:
         logger.error("Job %s not found", job_id)
         return {"status": "error", "message": "Job not found"}
 
-    source_path = Path(job["source_path"])
+    source_path = Path(platform_path(job["source_path"]))
     if not source_path.exists():
-        self.db.update_job_status(job_id, "failed", error="Source file not found")
-        return {"status": "failed", "message": "Source file not found"}
+        self.db.update_job_status(job_id, "failed", error=f"Source file not found: {source_path}")
+        return {"status": "failed", "message": f"Source file not found: {source_path}"}
 
     worker_id = f"local-{self.request.hostname}" if self.request.hostname else "local-0"
     start_time = time.time()
@@ -91,7 +93,7 @@ def process_job(self: LocalGPUTask, job_id: str):
                 worker_id=worker_id, current_stage="matting",
             )
 
-            output_path = Path(job["output_path"])
+            output_path = Path(platform_path(job["output_path"]))
             output_path.parent.mkdir(parents=True, exist_ok=True)
 
             matte_proc = MatteProcessor(settings)
@@ -164,7 +166,7 @@ def process_job(self: LocalGPUTask, job_id: str):
             worker_id=worker_id, current_stage="processing",
         )
 
-        output_path = Path(job["output_path"])
+        output_path = Path(platform_path(job["output_path"]))
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         pipeline = ProcessingPipeline(settings)
