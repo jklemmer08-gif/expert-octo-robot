@@ -10,7 +10,10 @@ from celery import Celery
 
 from src.config import get_settings
 
-app = Celery("ppp_processor")
+app = Celery(
+    "ppp_processor",
+    include=["src.workers.local_worker", "src.workers.cloud_worker"],
+)
 
 
 def _configure_celery():
