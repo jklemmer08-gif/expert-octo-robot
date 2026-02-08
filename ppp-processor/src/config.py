@@ -95,6 +95,12 @@ class MatteConfig(BaseSettings):
     downsample_ratio: float = 0.25  # Lower = faster, less accurate edges
     green_color: List[int] = Field(default_factory=lambda: [0, 177, 64])  # Heresphere default
     output_type: str = "green_screen"  # "green_screen" or "alpha_matte"
+    use_streaming: bool = True       # FFmpeg pipe streaming (False = legacy disk path)
+    fp16: bool = True                # FP16 mixed precision on CUDA
+    seq_chunk: int = 1               # Frames per forward pass (future batching)
+    encode_bitrate: str = "15M"      # 2D matting output bitrate
+    vr_encode_bitrate: str = "50M"   # VR matting output bitrate
+    progress_interval: int = 100     # Report progress every N frames
 
 
 class QAConfig(BaseSettings):

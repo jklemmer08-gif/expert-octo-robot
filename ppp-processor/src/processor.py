@@ -528,8 +528,47 @@ class MatteProcessor:
         )
         return model_path
 
+    def _probe_video_pipe_info(self, video_path: Path) -> dict:
+        """Probe video for dimensions, FPS, frame count, and audio presence."""
+        cmd = [
+            "ffprobe", "-v", "quiet", "-print_format", "json",
+            "-show_format", "-show_streams", str(video_path),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        data = json.loads(result.stdout)
+
+        video_stream = next(
+            (s for s in data.get("streams", []) if s.get("codec_type") == "video"),
+            None,
+        )
+        if not video_stream:
+            raise RuntimeError(f"No video stream found in {video_path}")
+
+        has_audio = any(
+            s.get("codec_type") == "audio" for s in data.get("streams", [])
+        )
+
+        # Parse FPS from r_frame_rate (e.g. "30000/1001")
+        fps_str = video_stream.get("r_frame_rate", "30/1")
+        num, den = fps_str.split("/")
+        fps = float(num) / float(den) if float(den) != 0 else 30.0
+
+        duration = float(data.get("format", {}).get("duration", 0))
+        nb_frames = video_stream.get("nb_frames")
+        total_frames = int(nb_frames) if nb_frames else int(duration * fps)
+
+        return {
+            "width": int(video_stream.get("width", 0)),
+            "height": int(video_stream.get("height", 0)),
+            "fps": fps,
+            "fps_str": fps_str,
+            "total_frames": total_frames,
+            "has_audio": has_audio,
+            "duration": duration,
+        }
+
     def _load_model(self, model_type: str = "mobilenetv3"):
-        """Load RVM model onto best available device."""
+        """Load RVM model onto best available device, optionally in FP16."""
         torch, transforms, np = _import_torch()
 
         model_path = self._ensure_model(model_type)
@@ -554,6 +593,13 @@ class MatteProcessor:
         self.model = MattingNetwork(model_type).eval()
         self.model.load_state_dict(torch.load(model_path, map_location=self.device))
         self.model = self.model.to(self.device)
+
+        # FP16 on CUDA for ~2x tensor core throughput
+        mc = self.settings.matte
+        self._use_fp16 = mc.fp16 and self.device.type == "cuda"
+        if self._use_fp16:
+            self.model = self.model.half()
+            logger.info("FP16 enabled — model converted to half precision")
 
     def matte_frames(
         self,
@@ -606,6 +652,206 @@ class MatteProcessor:
         logger.info("Matting complete: %d frames", total)
         return True
 
+    def _process_video_streaming(
+        self,
+        input_path: Path,
+        output_path: Path,
+        probe: dict,
+        crop_region: Optional[tuple] = None,
+        bitrate: str = "15M",
+        progress_callback: ProgressCallback = None,
+    ) -> bool:
+        """Streaming matting engine: FFmpeg pipe decode → GPU inference → pipe encode.
+
+        Args:
+            input_path: Source video file.
+            output_path: Destination matted video.
+            probe: Dict from _probe_video_pipe_info().
+            crop_region: Optional (x, y, w, h) to crop each decoded frame (for VR eye split).
+            bitrate: Encode bitrate string (e.g. "15M").
+            progress_callback: Optional (stage, pct) callback.
+        """
+        torch, transforms, np = _import_torch()
+        mc = self.settings.matte
+
+        if self.model is None:
+            self._load_model(mc.model_type)
+
+        src_w, src_h = probe["width"], probe["height"]
+        fps_str = probe["fps_str"]
+        total_frames = probe["total_frames"]
+
+        # Determine decode/process dimensions
+        if crop_region:
+            cx, cy, cw, ch = crop_region
+            vf_decode = f"crop={cw}:{ch}:{cx}:{cy}"
+            proc_w, proc_h = cw, ch
+        else:
+            vf_decode = None
+            proc_w, proc_h = src_w, src_h
+
+        frame_bytes = proc_w * proc_h * 3  # RGB24
+        pipe_bufsize = frame_bytes * 4  # 4 frames of buffer
+
+        # Pre-allocate green background tensor on GPU (stays resident)
+        green = mc.green_color
+        green_tensor = torch.tensor(
+            [[[green[0] / 255.0]], [[green[1] / 255.0]], [[green[2] / 255.0]]],
+            device=self.device,
+        )
+        if getattr(self, "_use_fp16", False):
+            green_tensor = green_tensor.half()
+
+        # --- FFmpeg decode pipe ---
+        decode_cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-i", str(input_path),
+        ]
+        if vf_decode:
+            decode_cmd.extend(["-vf", vf_decode])
+        decode_cmd.extend([
+            "-pix_fmt", "rgb24",
+            "-f", "rawvideo",
+            "-v", "error",
+            "pipe:1",
+        ])
+
+        # --- FFmpeg encode pipe ---
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        bufsize = str(int(bitrate.rstrip("M")) * 2) + "M"
+        encode_cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-y",
+            "-f", "rawvideo",
+            "-pix_fmt", "rgb24",
+            "-s", f"{proc_w}x{proc_h}",
+            "-r", fps_str,
+            "-i", "pipe:0",
+        ]
+        # Audio passthrough from source
+        if probe["has_audio"]:
+            encode_cmd.extend(["-i", str(input_path), "-map", "0:v", "-map", "1:a", "-c:a", "copy"])
+        encode_cmd.extend([
+            "-c:v", "libx265",
+            "-preset", self.settings.encode.preset,
+            "-crf", str(self.settings.encode.crf),
+            "-maxrate", bitrate,
+            "-bufsize", bufsize,
+            "-pix_fmt", "yuv420p",
+            "-tag:v", "hvc1",
+            "-movflags", "+faststart",
+            str(output_path),
+        ])
+
+        decoder = None
+        encoder = None
+        rec = [None] * 4
+
+        try:
+            decoder = subprocess.Popen(
+                decode_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                bufsize=pipe_bufsize,
+            )
+            encoder = subprocess.Popen(
+                encode_cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE,
+                bufsize=pipe_bufsize,
+            )
+
+            frame_idx = 0
+            while True:
+                raw = decoder.stdout.read(frame_bytes)
+                if not raw or len(raw) < frame_bytes:
+                    break
+
+                # numpy → torch tensor on GPU
+                frame_np = np.frombuffer(raw, dtype=np.uint8).reshape(proc_h, proc_w, 3)
+                src = torch.from_numpy(frame_np).permute(2, 0, 1).unsqueeze(0).float().to(self.device)
+                src = src / 255.0
+                if getattr(self, "_use_fp16", False):
+                    src = src.half()
+
+                with torch.no_grad():
+                    fgr, pha, *rec = self.model(src, *rec, mc.downsample_ratio)
+
+                # GPU compositing: alpha * foreground + (1 - alpha) * green
+                composite = pha * fgr + (1.0 - pha) * green_tensor
+                composite = composite.clamp(0.0, 1.0)
+
+                # Back to bytes
+                out_np = (composite[0].permute(1, 2, 0).float().cpu().numpy() * 255).astype(np.uint8)
+                encoder.stdin.write(out_np.tobytes())
+
+                frame_idx += 1
+                if progress_callback and frame_idx % mc.progress_interval == 0:
+                    pct = min(frame_idx / max(total_frames, 1) * 100, 99)
+                    progress_callback("matting", pct)
+                if frame_idx % mc.progress_interval == 0:
+                    logger.info("  Streamed %d/%d frames", frame_idx, total_frames)
+
+                del src, fgr, pha, composite
+
+            encoder.stdin.close()
+            encoder.wait()
+            decoder.wait()
+
+            if encoder.returncode != 0:
+                err = encoder.stderr.read().decode() if encoder.stderr else ""
+                logger.error("Encode pipe failed: %s", err[-500:])
+                return False
+
+            logger.info("Streaming matting complete: %d frames", frame_idx)
+            return True
+
+        finally:
+            if decoder and decoder.poll() is None:
+                decoder.kill()
+            if encoder and encoder.poll() is None:
+                encoder.kill()
+            if self.device and self.device.type == "cuda":
+                torch.cuda.empty_cache()
+
+    def _merge_sbs_videos(
+        self,
+        left_path: Path,
+        right_path: Path,
+        output_path: Path,
+        audio_source: Path,
+        has_audio: bool = True,
+    ) -> bool:
+        """Merge two matted eye videos side-by-side using FFmpeg hstack."""
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        cmd = [
+            "ffmpeg", "-hide_banner", "-y",
+            "-i", str(left_path),
+            "-i", str(right_path),
+        ]
+        if has_audio:
+            cmd.extend(["-i", str(audio_source)])
+
+        cmd.extend([
+            "-filter_complex", "[0:v][1:v]hstack=inputs=2[v]",
+            "-map", "[v]",
+        ])
+        if has_audio:
+            cmd.extend(["-map", "2:a", "-c:a", "copy"])
+
+        cmd.extend([
+            "-c:v", "libx265",
+            "-preset", self.settings.encode.preset,
+            "-crf", str(self.settings.encode.crf),
+            "-tag:v", "hvc1",
+            "-movflags", "+faststart",
+            str(output_path),
+        ])
+
+        logger.info("Merging L/R matted videos to SBS: %s", output_path.name)
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            logger.error("SBS merge failed: %s", result.stderr[-500:])
+            return False
+        return True
+
     def process_video(
         self,
         input_path: Path,
@@ -613,8 +859,53 @@ class MatteProcessor:
         info: VideoInfo,
         progress_callback: ProgressCallback = None,
     ) -> bool:
-        """Full matting pipeline for a 2D video."""
-        logger.info("Matting video: %s", input_path.name)
+        """Full matting pipeline for a 2D video.
+
+        Dispatches to streaming (FFmpeg pipes) or legacy (disk-based) path
+        based on settings.matte.use_streaming.
+        """
+        mc = self.settings.matte
+        if mc.use_streaming:
+            return self._process_video_streaming_2d(
+                input_path, output_path, progress_callback,
+            )
+        return self._process_video_legacy(
+            input_path, output_path, info, progress_callback,
+        )
+
+    def _process_video_streaming_2d(
+        self,
+        input_path: Path,
+        output_path: Path,
+        progress_callback: ProgressCallback = None,
+    ) -> bool:
+        """Streaming matting for a 2D video."""
+        logger.info("Matting video (streaming): %s", input_path.name)
+        mc = self.settings.matte
+
+        if progress_callback:
+            progress_callback("probing", 1)
+
+        probe = self._probe_video_pipe_info(input_path)
+        success = self._process_video_streaming(
+            input_path, output_path, probe,
+            bitrate=mc.encode_bitrate,
+            progress_callback=progress_callback,
+        )
+
+        if progress_callback:
+            progress_callback("complete" if success else "failed", 100 if success else 0)
+        return success
+
+    def _process_video_legacy(
+        self,
+        input_path: Path,
+        output_path: Path,
+        info: VideoInfo,
+        progress_callback: ProgressCallback = None,
+    ) -> bool:
+        """Legacy disk-based matting for a 2D video."""
+        logger.info("Matting video (legacy): %s", input_path.name)
         mc = self.settings.matte
 
         temp_dir = Path(self.settings.paths.temp_dir)
@@ -653,7 +944,7 @@ class MatteProcessor:
             success = encoder.encode(
                 matted_dir, output_path, info.fps,
                 audio_source=input_path,
-                bitrate="15M",
+                bitrate=mc.encode_bitrate,
             )
 
             if progress_callback:
@@ -673,8 +964,101 @@ class MatteProcessor:
         info: VideoInfo,
         progress_callback: ProgressCallback = None,
     ) -> bool:
-        """Matte VR SBS video — process each eye independently for temporal consistency."""
-        logger.info("Matting VR SBS: %s", input_path.name)
+        """Matte VR SBS video — each eye independently for temporal consistency.
+
+        Dispatches to streaming or legacy path based on settings.matte.use_streaming.
+        """
+        mc = self.settings.matte
+        if mc.use_streaming:
+            return self._process_vr_sbs_streaming(
+                input_path, output_path, progress_callback,
+            )
+        return self._process_vr_sbs_legacy(
+            input_path, output_path, info, progress_callback,
+        )
+
+    def _process_vr_sbs_streaming(
+        self,
+        input_path: Path,
+        output_path: Path,
+        progress_callback: ProgressCallback = None,
+    ) -> bool:
+        """Streaming VR SBS: crop L/R eyes from pipe, matte separately, hstack merge."""
+        logger.info("Matting VR SBS (streaming): %s", input_path.name)
+        mc = self.settings.matte
+
+        temp_dir = Path(self.settings.paths.temp_dir)
+        work_dir = temp_dir / f"matte_vr_{input_path.stem}"
+        work_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            if progress_callback:
+                progress_callback("probing", 1)
+
+            probe = self._probe_video_pipe_info(input_path)
+            half_w = probe["width"] // 2
+            h = probe["height"]
+
+            left_tmp = work_dir / "left_matted.mp4"
+            right_tmp = work_dir / "right_matted.mp4"
+
+            # Matte left eye (crop from left half)
+            if progress_callback:
+                progress_callback("matting_left", 5)
+
+            success = self._process_video_streaming(
+                input_path, left_tmp, probe,
+                crop_region=(0, 0, half_w, h),
+                bitrate=mc.vr_encode_bitrate,
+                progress_callback=progress_callback,
+            )
+            if not success:
+                return False
+
+            # Reset recurrent state for right eye
+            self.model = None
+
+            if progress_callback:
+                progress_callback("matting_right", 50)
+
+            success = self._process_video_streaming(
+                input_path, right_tmp, probe,
+                crop_region=(half_w, 0, half_w, h),
+                bitrate=mc.vr_encode_bitrate,
+                progress_callback=progress_callback,
+            )
+            if not success:
+                return False
+
+            # Merge L/R into SBS output
+            if progress_callback:
+                progress_callback("merging", 95)
+
+            success = self._merge_sbs_videos(
+                left_tmp, right_tmp, output_path,
+                audio_source=input_path,
+                has_audio=probe["has_audio"],
+            )
+
+            if progress_callback:
+                progress_callback("complete" if success else "failed", 100 if success else 0)
+
+            return success
+
+        finally:
+            if work_dir.exists():
+                logger.info("Cleaning up VR matte temp files: %s", work_dir)
+                shutil.rmtree(work_dir)
+
+    def _process_vr_sbs_legacy(
+        self,
+        input_path: Path,
+        output_path: Path,
+        info: VideoInfo,
+        progress_callback: ProgressCallback = None,
+    ) -> bool:
+        """Legacy disk-based VR SBS matting."""
+        logger.info("Matting VR SBS (legacy): %s", input_path.name)
         mc = self.settings.matte
 
         temp_dir = Path(self.settings.paths.temp_dir)
@@ -712,7 +1096,7 @@ class MatteProcessor:
             )
 
             # Reset recurrent state for right eye
-            self.model = None  # Force re-init for clean temporal state
+            self.model = None
 
             if progress_callback:
                 progress_callback("matting_right", 50)
@@ -740,7 +1124,7 @@ class MatteProcessor:
             success = encoder.encode(
                 merged_dir, output_path, info.fps,
                 audio_source=input_path,
-                bitrate="50M",
+                bitrate=mc.vr_encode_bitrate,
             )
 
             if progress_callback:
