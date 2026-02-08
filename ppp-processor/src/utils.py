@@ -6,6 +6,7 @@ Includes path remapping from batch_process.py and common helpers.
 from __future__ import annotations
 
 import hashlib
+import platform
 from pathlib import Path
 from typing import List, Tuple
 
@@ -28,6 +29,15 @@ PATH_REMAPS: List[Tuple[str, str]] = [
 ]
 
 
+# Windows (Samba) path remapping — Linux host paths to mapped drive letters
+WINDOWS_PATH_REMAPS: List[Tuple[str, str]] = [
+    ("/home/jtk1234/media-drive1/", "M:/"),
+    ("/home/jtk1234/media-drive1", "M:"),
+    ("/home/jtk1234/media-drive2/", "N:/"),
+    ("/home/jtk1234/media-drive2", "N:"),
+]
+
+
 def remap_path(path: str) -> str:
     """Remap a Stash Docker container path to the host filesystem path.
 
@@ -36,6 +46,17 @@ def remap_path(path: str) -> str:
     for docker_prefix, local_prefix in PATH_REMAPS:
         if path.startswith(docker_prefix):
             return local_prefix + path[len(docker_prefix):]
+    return path
+
+
+def platform_path(path: str) -> str:
+    """Remap Linux paths to Windows drive letters when running on Windows."""
+    if platform.system() != "Windows":
+        return path
+    for linux_prefix, win_prefix in WINDOWS_PATH_REMAPS:
+        if path.startswith(linux_prefix):
+            remapped = win_prefix + path[len(linux_prefix):]
+            return remapped.replace("/", "\\")
     return path
 
 
