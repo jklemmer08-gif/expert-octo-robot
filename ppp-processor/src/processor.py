@@ -539,7 +539,7 @@ class MatteProcessor:
             result = subprocess.run(
                 [
                     "ffmpeg", "-hide_banner", "-y",
-                    "-f", "lavfi", "-i", "nullsrc=s=64x64:d=0.1",
+                    "-f", "lavfi", "-i", "nullsrc=s=256x256:d=0.1",
                     "-c:v", "hevc_nvenc", "-f", "null", "-",
                 ],
                 capture_output=True, text=True, timeout=10,
