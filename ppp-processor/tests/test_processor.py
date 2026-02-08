@@ -1,7 +1,7 @@
 """Tests for the processing pipeline components."""
 
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, patch, PropertyMock
 
 import pytest
 
@@ -292,3 +292,110 @@ class TestMatteProcessor:
 
         assert proc._use_fp16 is False
         mock_model.half.assert_not_called()
+
+    @patch("src.processor.subprocess.run")
+    def test_probe_nvenc_available(self, mock_run, test_settings):
+        """_probe_nvenc returns True when NVENC test succeeds."""
+        mock_run.return_value = MagicMock(returncode=0)
+        proc = self._make_processor(test_settings)
+        proc._nvenc_available = None
+
+        result = proc._probe_nvenc()
+        assert result is True
+        assert proc._nvenc_available is True
+        # Second call should use cached result
+        result2 = proc._probe_nvenc()
+        assert result2 is True
+        assert mock_run.call_count == 1
+
+    @patch("src.processor.subprocess.run")
+    def test_probe_nvenc_unavailable(self, mock_run, test_settings):
+        """_probe_nvenc returns False when NVENC test fails."""
+        mock_run.return_value = MagicMock(returncode=1)
+        proc = self._make_processor(test_settings)
+        proc._nvenc_available = None
+
+        result = proc._probe_nvenc()
+        assert result is False
+        assert proc._nvenc_available is False
+
+    @patch("src.processor.subprocess.run")
+    def test_build_encode_cmd_nvenc(self, mock_run, test_settings):
+        """_build_encode_cmd uses NVENC params when available."""
+        mock_run.return_value = MagicMock(returncode=0)
+        proc = self._make_processor(test_settings)
+        proc._nvenc_available = None
+
+        cmd = proc._build_encode_cmd(
+            ["-f", "rawvideo", "-i", "pipe:0"],
+            Path("/fake/output.mp4"),
+            "15M",
+        )
+        assert "hevc_nvenc" in cmd
+        assert "-preset" not in cmd or "p5" in cmd
+        assert "-rc" in cmd
+        assert "constqp" in cmd
+
+    @patch("src.processor.subprocess.run")
+    def test_build_encode_cmd_fallback(self, mock_run, test_settings):
+        """_build_encode_cmd uses libx265 when NVENC unavailable."""
+        mock_run.return_value = MagicMock(returncode=1)
+        proc = self._make_processor(test_settings)
+        proc._nvenc_available = None
+
+        cmd = proc._build_encode_cmd(
+            ["-f", "rawvideo", "-i", "pipe:0"],
+            Path("/fake/output.mp4"),
+            "15M",
+        )
+        assert "libx265" in cmd
+        assert "-crf" in cmd
+
+    def test_prepare_inference_engine_disabled(self, test_settings):
+        """_prepare_inference_engine is a no-op when TRT is disabled."""
+        test_settings.tensorrt.enabled = False
+        proc = self._make_processor(test_settings)
+        proc._trt_engine = None
+
+        proc._prepare_inference_engine(1080, 1920)
+        assert proc._trt_engine is None
+
+    def test_infer_frame_pytorch_fallback(self, test_settings):
+        """_infer_frame dispatches to PyTorch model when no TRT engine."""
+        proc = self._make_processor(test_settings)
+        proc._trt_engine = None
+
+        mock_model = MagicMock()
+        mock_model.return_value = (MagicMock(), MagicMock(), MagicMock(), MagicMock(), MagicMock(), MagicMock())
+        proc.model = mock_model
+
+        mock_torch = MagicMock()
+        mock_torch.no_grad.return_value.__enter__ = MagicMock()
+        mock_torch.no_grad.return_value.__exit__ = MagicMock()
+
+        with patch("src.processor._import_torch", return_value=(mock_torch, MagicMock(), MagicMock())):
+            result = proc._infer_frame(MagicMock(), [None] * 4, 0.25)
+        assert mock_model.called
+
+    def test_vr_recurrent_state_reset_with_trt(self, test_settings):
+        """VR streaming path resets TRT recurrent state between eyes."""
+        test_settings.matte.use_streaming = True
+        proc = self._make_processor(test_settings)
+
+        mock_trt_engine = MagicMock()
+        proc._trt_engine = mock_trt_engine
+
+        with patch.object(proc, "_process_video_streaming", return_value=True), \
+             patch.object(proc, "_merge_sbs_videos", return_value=True), \
+             patch.object(proc, "_probe_video_pipe_info", return_value={
+                 "width": 3840, "height": 1920, "fps": 30,
+                 "fps_str": "30/1", "total_frames": 900,
+                 "has_audio": True, "duration": 30.0,
+             }):
+            info = VideoInfo(width=3840, height=1920, fps=30, duration=30,
+                             codec="h264", bitrate=50000000, is_vr=True,
+                             content_type=ContentType.VR_SBS)
+            proc._process_vr_sbs_streaming(
+                Path("/fake/vr.mp4"), Path("/fake/vr_out.mp4"), None,
+            )
+            mock_trt_engine.reset_recurrent_state.assert_called_once()

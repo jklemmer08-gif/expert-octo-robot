@@ -97,6 +97,7 @@ class JobCreate(BaseModel):
     scene_id: Optional[str] = None
     title: Optional[str] = None
     matte: bool = False  # Enable background removal / chroma key
+    upscale: bool = False  # Enable upscale-only job (no QA sampling)
 
 
 class JobResponse(BaseModel):
@@ -111,6 +112,7 @@ class JobResponse(BaseModel):
     scale: Optional[int] = None
     is_vr: bool = False
     matte: bool = False
+    upscale: bool = False
     status: JobStatus = JobStatus.PENDING
     priority: int = 0
     created_at: Optional[datetime] = None

@@ -38,13 +38,37 @@ class UpscaleConfig(BaseSettings):
 
 class EncodeConfig(BaseSettings):
     codec: str = "hevc"
-    encoder: str = "hevc_vaapi"
+    encoder: str = "hevc_nvenc"
     fallback_encoder: str = "libx265"
     bitrates: Dict[str, str] = Field(default_factory=lambda: {
         "8K": "150M", "6K": "100M", "5K": "80M", "4K": "50M", "1080p": "15M",
     })
     crf: int = 20
     preset: str = "medium"
+    # NVENC-specific params
+    qp: int = 20
+    nvenc_preset: str = "p5"
+    tune: str = "hq"
+    rc_mode: str = "constqp"
+    spatial_aq: bool = True
+    temporal_aq: bool = True
+    rc_lookahead: int = 32
+    profile: str = "main10"
+
+
+class TensorRTConfig(BaseSettings):
+    """TensorRT inference settings for RVM."""
+    enabled: bool = False
+    cache_dir: str = "./trt_engines"
+    fp16: bool = True
+    max_workspace_mb: int = 4096
+    resolution_buckets: List[Dict[str, Any]] = Field(default_factory=lambda: [
+        {"name": "720p", "min_h": 360, "min_w": 640, "opt_h": 720, "opt_w": 1280, "max_h": 768, "max_w": 1408},
+        {"name": "1080p", "min_h": 720, "min_w": 1280, "opt_h": 1080, "opt_w": 1920, "max_h": 1152, "max_w": 2048},
+        {"name": "1440p", "min_h": 1080, "min_w": 1920, "opt_h": 1440, "opt_w": 2560, "max_h": 1536, "max_w": 2816},
+        {"name": "4k", "min_h": 1440, "min_w": 2560, "opt_h": 2160, "opt_w": 3840, "max_h": 2304, "max_w": 4096},
+        {"name": "vr", "min_h": 1440, "min_w": 1920, "opt_h": 2160, "opt_w": 2160, "max_h": 2880, "max_w": 2880},
+    ])
 
 
 class StashConfig(BaseSettings):
@@ -135,6 +159,7 @@ class Settings(BaseSettings):
     watcher: WatcherConfig = Field(default_factory=WatcherConfig)
     qa: QAConfig = Field(default_factory=QAConfig)
     matte: MatteConfig = Field(default_factory=MatteConfig)
+    tensorrt: TensorRTConfig = Field(default_factory=TensorRTConfig)
     tiers: Dict[str, Any] = Field(default_factory=dict)
 
     @classmethod

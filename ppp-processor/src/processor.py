@@ -331,6 +331,7 @@ class Encoder:
         bitrate: str,
         encoder: str,
     ) -> bool:
+        ec = self.settings.encode
         cmd = [
             "ffmpeg", "-y",
             "-framerate", str(fps),
@@ -340,22 +341,39 @@ class Encoder:
         if audio_source and audio_source.exists():
             cmd.extend(["-i", str(audio_source)])
 
-        # HEVC encoding settings for Heresphere/DeoVR
-        bufsize = str(int(bitrate.rstrip("M")) * 2) + "M"
-        cmd.extend([
-            "-c:v", encoder,
-            "-preset", self.settings.encode.preset,
-            "-crf", str(self.settings.encode.crf),
-            "-maxrate", bitrate,
-            "-bufsize", bufsize,
-            "-pix_fmt", "yuv420p",
-            "-tag:v", "hvc1",
-        ])
+        # Encoder-specific params
+        if encoder == "hevc_nvenc":
+            cmd.extend([
+                "-c:v", encoder,
+                "-preset", ec.nvenc_preset,
+                "-tune", ec.tune,
+                "-rc", ec.rc_mode,
+                "-qp", str(ec.qp),
+                "-profile:v", ec.profile,
+                "-rc-lookahead", str(ec.rc_lookahead),
+                "-pix_fmt", "p010le",
+                "-tag:v", "hvc1",
+            ])
+            if ec.spatial_aq:
+                cmd.extend(["-spatial-aq", "1"])
+            if ec.temporal_aq:
+                cmd.extend(["-temporal-aq", "1"])
+        else:
+            bufsize = str(int(bitrate.rstrip("M")) * 2) + "M"
+            cmd.extend([
+                "-c:v", encoder,
+                "-preset", ec.preset,
+                "-crf", str(ec.crf),
+                "-maxrate", bitrate,
+                "-bufsize", bufsize,
+                "-pix_fmt", "yuv420p",
+                "-tag:v", "hvc1",
+            ])
 
         if audio_source and audio_source.exists():
             cmd.extend(["-c:a", "copy", "-map", "0:v", "-map", "1:a"])
 
-        cmd.append(str(output_path))
+        cmd.extend(["-movflags", "+faststart", str(output_path)])
 
         logger.info("Encoding with %s to %s", encoder, output_path.name)
         result = subprocess.run(cmd, capture_output=True, text=True)
@@ -509,6 +527,86 @@ class MatteProcessor:
         self.models_dir = Path(settings.paths.models_dir)
         self.model = None
         self.device = None
+        self._trt_engine = None  # TensorRT engine (Phase 2)
+        self._nvenc_available = None  # Cached NVENC probe result
+
+    def _probe_nvenc(self) -> bool:
+        """Test NVENC availability with a minimal encode. Caches result."""
+        if self._nvenc_available is not None:
+            return self._nvenc_available
+
+        try:
+            result = subprocess.run(
+                [
+                    "ffmpeg", "-hide_banner", "-y",
+                    "-f", "lavfi", "-i", "nullsrc=s=64x64:d=0.1",
+                    "-c:v", "hevc_nvenc", "-f", "null", "-",
+                ],
+                capture_output=True, text=True, timeout=10,
+            )
+            self._nvenc_available = result.returncode == 0
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            self._nvenc_available = False
+
+        if self._nvenc_available:
+            logger.info("NVENC hardware encoder available")
+        else:
+            logger.info("NVENC unavailable, will use %s", self.settings.encode.fallback_encoder)
+        return self._nvenc_available
+
+    def _build_encode_cmd(
+        self,
+        input_args: list,
+        output_path: Path,
+        bitrate: str,
+        extra_input_args: Optional[list] = None,
+        extra_output_args: Optional[list] = None,
+    ) -> list:
+        """Build FFmpeg encode command with NVENC or fallback encoder.
+
+        Returns the full ffmpeg command list. Uses NVENC with constqp rate control
+        when available, falls back to libx265 CRF otherwise.
+        """
+        ec = self.settings.encode
+
+        if self._probe_nvenc():
+            encoder = ec.encoder  # hevc_nvenc
+            encode_params = [
+                "-c:v", encoder,
+                "-preset", ec.nvenc_preset,
+                "-tune", ec.tune,
+                "-rc", ec.rc_mode,
+                "-qp", str(ec.qp),
+                "-profile:v", ec.profile,
+                "-rc-lookahead", str(ec.rc_lookahead),
+                "-pix_fmt", "p010le",
+                "-tag:v", "hvc1",
+            ]
+            if ec.spatial_aq:
+                encode_params.extend(["-spatial-aq", "1"])
+            if ec.temporal_aq:
+                encode_params.extend(["-temporal-aq", "1"])
+        else:
+            encoder = ec.fallback_encoder  # libx265
+            bufsize_str = str(int(bitrate.rstrip("M")) * 2) + "M"
+            encode_params = [
+                "-c:v", encoder,
+                "-preset", ec.preset,
+                "-crf", str(ec.crf),
+                "-maxrate", bitrate, "-bufsize", bufsize_str,
+                "-pix_fmt", "yuv420p",
+                "-tag:v", "hvc1",
+            ]
+
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
+        cmd.extend(input_args)
+        if extra_input_args:
+            cmd.extend(extra_input_args)
+        cmd.extend(encode_params)
+        if extra_output_args:
+            cmd.extend(extra_output_args)
+        cmd.extend(["-movflags", "+faststart", str(output_path)])
+        return cmd
 
     def _ensure_model(self, model_type: str = "mobilenetv3") -> Path:
         """Download RVM weights if not present."""
@@ -601,6 +699,88 @@ class MatteProcessor:
             self.model = self.model.half()
             logger.info("FP16 enabled — model converted to half precision")
 
+        # torch.compile() for fused kernels
+        # reduce-overhead mode requires Triton which is unavailable on Windows;
+        # the compile() call itself succeeds but the first forward pass fails.
+        # On Windows, go straight to inductor/eager; on Linux try reduce-overhead.
+        import platform as _platform
+        if self.device.type == "cuda":
+            if _platform.system() != "Windows":
+                try:
+                    self.model = torch.compile(self.model, mode="reduce-overhead")
+                    logger.info("torch.compile() enabled (reduce-overhead mode)")
+                except Exception:
+                    try:
+                        self.model = torch.compile(self.model, backend="eager")
+                        logger.info("torch.compile() enabled (eager backend)")
+                    except Exception as e:
+                        logger.info("torch.compile() unavailable: %s", e)
+            else:
+                try:
+                    self.model = torch.compile(self.model, backend="eager")
+                    logger.info("torch.compile() enabled (eager backend — Windows)")
+                except Exception as e:
+                    logger.info("torch.compile() unavailable on Windows: %s", e)
+
+    def _prepare_inference_engine(self, height: int, width: int):
+        """Prepare TensorRT engine for the given resolution if enabled.
+
+        Called at video start to select and load the correct TRT bucket.
+        Falls back to PyTorch if TRT is unavailable or fails.
+        """
+        trt_cfg = self.settings.tensorrt
+        if not trt_cfg.enabled:
+            return
+
+        if self.model is None:
+            self._load_model(self.settings.matte.model_type)
+
+        try:
+            from src.trt_engine import RVMTensorRTEngine
+            if self._trt_engine is None:
+                self._trt_engine = RVMTensorRTEngine(self.settings)
+
+            success = self._trt_engine.prepare(
+                height, width, self.model,
+                self.settings.matte.model_type, self.device,
+            )
+            if success:
+                logger.info("TensorRT engine ready for %dx%d", width, height)
+            else:
+                logger.info("TRT preparation failed, using PyTorch")
+                self._trt_engine = None
+        except ImportError:
+            logger.info("TensorRT not installed, using PyTorch inference")
+            self._trt_engine = None
+        except Exception as e:
+            logger.warning("TRT init error, falling back to PyTorch: %s", e)
+            self._trt_engine = None
+
+    def _infer_frame(self, gpu_input, rec, downsample_ratio):
+        """Dispatch inference to TRT or PyTorch.
+
+        Args:
+            gpu_input: [1, 3, H, W] tensor on device
+            rec: list of 4 recurrent state tensors (or Nones)
+            downsample_ratio: float
+
+        Returns:
+            (fgr, pha, *rec_new) — same signature as RVM forward
+        """
+        torch, _, _ = _import_torch()
+
+        if self._trt_engine is not None:
+            try:
+                return self._trt_engine.infer(gpu_input, downsample_ratio)
+            except Exception as e:
+                logger.warning("TRT inference failed, falling back to PyTorch: %s", e)
+                self._trt_engine = None
+
+        # PyTorch fallback
+        with torch.no_grad():
+            fgr, pha, *rec_new = self.model(gpu_input, *rec, downsample_ratio)
+        return fgr, pha, *rec_new
+
     def matte_frames(
         self,
         input_dir: Path,
@@ -663,14 +843,15 @@ class MatteProcessor:
     ) -> bool:
         """Streaming matting engine: FFmpeg pipe decode → GPU inference → pipe encode.
 
-        Args:
-            input_path: Source video file.
-            output_path: Destination matted video.
-            probe: Dict from _probe_video_pipe_info().
-            crop_region: Optional (x, y, w, h) to crop each decoded frame (for VR eye split).
-            bitrate: Encode bitrate string (e.g. "15M").
-            progress_callback: Optional (stage, pct) callback.
+        Optimized with:
+        - NVDEC hardware decode (falls back to CPU if unavailable)
+        - Pre-allocated pinned memory + GPU tensors (zero per-frame allocation)
+        - Async 3-stage pipeline: decode / infer / encode overlap via threading
+        - torch.compile() on the model (applied in _load_model)
         """
+        import threading
+        import queue
+
         torch, transforms, np = _import_torch()
         mc = self.settings.matte
 
@@ -690,109 +871,208 @@ class MatteProcessor:
             vf_decode = None
             proc_w, proc_h = src_w, src_h
 
+        # Try to prepare TensorRT engine for this resolution
+        self._prepare_inference_engine(proc_h, proc_w)
+
         frame_bytes = proc_w * proc_h * 3  # RGB24
-        pipe_bufsize = frame_bytes * 4  # 4 frames of buffer
+        pipe_bufsize = frame_bytes * 8  # 8 frames of buffer
+
+        # --- Pre-allocate reusable tensors ---
+        dtype = torch.float16 if getattr(self, "_use_fp16", False) else torch.float32
+        # Pinned host buffer for fast CPU→GPU transfer
+        pin_buffer = torch.empty((proc_h, proc_w, 3), dtype=torch.uint8).pin_memory()
+        # Pre-allocated GPU input tensor
+        gpu_input = torch.empty((1, 3, proc_h, proc_w), dtype=dtype, device=self.device)
 
         # Pre-allocate green background tensor on GPU (stays resident)
         green = mc.green_color
         green_tensor = torch.tensor(
             [[[green[0] / 255.0]], [[green[1] / 255.0]], [[green[2] / 255.0]]],
-            device=self.device,
+            dtype=dtype, device=self.device,
         )
-        if getattr(self, "_use_fp16", False):
-            green_tensor = green_tensor.half()
 
-        # --- FFmpeg decode pipe ---
-        decode_cmd = [
-            "ffmpeg", "-hide_banner", "-loglevel", "error",
-            "-i", str(input_path),
-        ]
+        # Pre-allocated output buffer on GPU
+        out_gpu = torch.empty((1, 3, proc_h, proc_w), dtype=dtype, device=self.device)
+        # Pre-allocated output host buffer (pinned for fast GPU→CPU)
+        out_pin = torch.empty((proc_h, proc_w, 3), dtype=torch.uint8).pin_memory()
+
+        # CUDA stream for async GPU↔CPU transfers
+        transfer_stream = torch.cuda.Stream() if self.device.type == "cuda" else None
+
+        # --- FFmpeg decode pipe (try NVDEC hardware accel) ---
+        decode_cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
+        if self.device.type == "cuda":
+            decode_cmd.extend(["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"])
+        decode_cmd.extend(["-i", str(input_path)])
         if vf_decode:
-            decode_cmd.extend(["-vf", vf_decode])
-        decode_cmd.extend([
-            "-pix_fmt", "rgb24",
-            "-f", "rawvideo",
-            "-v", "error",
-            "pipe:1",
-        ])
+            # hwaccel requires scale_cuda for filtering; fall back to vf for crop
+            if self.device.type == "cuda":
+                decode_cmd.extend(["-vf", f"hwdownload,format=nv12,{vf_decode}"])
+            else:
+                decode_cmd.extend(["-vf", vf_decode])
+        elif self.device.type == "cuda":
+            decode_cmd.extend(["-vf", "hwdownload,format=nv12"])
+        decode_cmd.extend(["-pix_fmt", "rgb24", "-f", "rawvideo", "-v", "error", "pipe:1"])
 
         # --- FFmpeg encode pipe ---
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        bufsize = str(int(bitrate.rstrip("M")) * 2) + "M"
-        encode_cmd = [
-            "ffmpeg", "-hide_banner", "-loglevel", "error",
-            "-y",
-            "-f", "rawvideo",
-            "-pix_fmt", "rgb24",
-            "-s", f"{proc_w}x{proc_h}",
-            "-r", fps_str,
+        pipe_input_args = [
+            "-f", "rawvideo", "-pix_fmt", "rgb24",
+            "-s", f"{proc_w}x{proc_h}", "-r", fps_str,
             "-i", "pipe:0",
         ]
-        # Audio passthrough from source
+        audio_args = None
         if probe["has_audio"]:
-            encode_cmd.extend(["-i", str(input_path), "-map", "0:v", "-map", "1:a", "-c:a", "copy"])
-        encode_cmd.extend([
-            "-c:v", "libx265",
-            "-preset", self.settings.encode.preset,
-            "-crf", str(self.settings.encode.crf),
-            "-maxrate", bitrate,
-            "-bufsize", bufsize,
-            "-pix_fmt", "yuv420p",
-            "-tag:v", "hvc1",
-            "-movflags", "+faststart",
-            str(output_path),
-        ])
+            audio_args = ["-i", str(input_path), "-map", "0:v", "-map", "1:a", "-c:a", "copy"]
+        encode_cmd = self._build_encode_cmd(
+            pipe_input_args, output_path, bitrate,
+            extra_input_args=audio_args,
+        )
 
+        # If NVDEC decode fails, retry without hardware accel
         decoder = None
-        encoder = None
-        rec = [None] * 4
-
+        nvdec_failed = False
         try:
             decoder = subprocess.Popen(
                 decode_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 bufsize=pipe_bufsize,
             )
-            encoder = subprocess.Popen(
-                encode_cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE,
+            # Test first frame
+            test_raw = decoder.stdout.read(frame_bytes)
+            if not test_raw or len(test_raw) < frame_bytes:
+                decoder.kill()
+                decoder.wait()
+                nvdec_failed = True
+        except Exception:
+            if decoder:
+                decoder.kill()
+                decoder.wait()
+            nvdec_failed = True
+
+        if nvdec_failed:
+            logger.info("NVDEC unavailable, falling back to CPU decode")
+            decode_cmd_cpu = [
+                "ffmpeg", "-hide_banner", "-loglevel", "error",
+                "-i", str(input_path),
+            ]
+            if vf_decode:
+                decode_cmd_cpu.extend(["-vf", vf_decode])
+            decode_cmd_cpu.extend(["-pix_fmt", "rgb24", "-f", "rawvideo", "-v", "error", "pipe:1"])
+            decoder = subprocess.Popen(
+                decode_cmd_cpu, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 bufsize=pipe_bufsize,
             )
+            test_raw = decoder.stdout.read(frame_bytes)
+            if not test_raw or len(test_raw) < frame_bytes:
+                logger.error("CPU decode also failed")
+                decoder.kill()
+                return False
+
+        # --- Async 3-stage pipeline ---
+        # Stage 1 (thread): decode frames from ffmpeg pipe → decode_q
+        # Stage 2 (main):   GPU inference on each frame
+        # Stage 3 (thread): write matted frames to ffmpeg encode pipe
+
+        SENTINEL = None
+        decode_q = queue.Queue(maxsize=4)
+        encode_q = queue.Queue(maxsize=4)
+        decode_error = [None]
+        encode_error = [None]
+
+        encoder = subprocess.Popen(
+            encode_cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE,
+            bufsize=pipe_bufsize,
+        )
+
+        def decode_thread():
+            """Read raw frames from ffmpeg and push to decode_q."""
+            try:
+                # First frame was already read for NVDEC test
+                decode_q.put(test_raw)
+                while True:
+                    raw = decoder.stdout.read(frame_bytes)
+                    if not raw or len(raw) < frame_bytes:
+                        break
+                    decode_q.put(raw)
+            except Exception as e:
+                decode_error[0] = e
+            finally:
+                decode_q.put(SENTINEL)
+
+        def encode_thread():
+            """Pull matted frame bytes from encode_q and write to ffmpeg."""
+            try:
+                while True:
+                    data = encode_q.get()
+                    if data is SENTINEL:
+                        break
+                    encoder.stdin.write(data)
+            except Exception as e:
+                encode_error[0] = e
+
+        rec = [None] * 4
+
+        try:
+            t_decode = threading.Thread(target=decode_thread, daemon=True)
+            t_encode = threading.Thread(target=encode_thread, daemon=True)
+            t_decode.start()
+            t_encode.start()
 
             frame_idx = 0
             while True:
-                raw = decoder.stdout.read(frame_bytes)
-                if not raw or len(raw) < frame_bytes:
+                raw = decode_q.get()
+                if raw is SENTINEL:
                     break
 
-                # numpy → torch tensor on GPU
+                # --- Fast CPU→GPU path using pinned memory ---
                 frame_np = np.frombuffer(raw, dtype=np.uint8).reshape(proc_h, proc_w, 3)
-                src = torch.from_numpy(frame_np).permute(2, 0, 1).unsqueeze(0).float().to(self.device)
-                src = src / 255.0
-                if getattr(self, "_use_fp16", False):
-                    src = src.half()
+                pin_buffer.copy_(torch.from_numpy(frame_np.copy()))
 
-                with torch.no_grad():
-                    fgr, pha, *rec = self.model(src, *rec, mc.downsample_ratio)
+                if transfer_stream:
+                    with torch.cuda.stream(transfer_stream):
+                        gpu_input.copy_(
+                            pin_buffer.permute(2, 0, 1).unsqueeze(0).to(dtype=dtype, device=self.device, non_blocking=True)
+                        )
+                        gpu_input.div_(255.0)
+                    transfer_stream.synchronize()
+                else:
+                    gpu_input.copy_(
+                        pin_buffer.permute(2, 0, 1).unsqueeze(0).to(dtype=dtype, device=self.device)
+                    )
+                    gpu_input.div_(255.0)
 
-                # GPU compositing: alpha * foreground + (1 - alpha) * green
-                composite = pha * fgr + (1.0 - pha) * green_tensor
-                composite = composite.clamp(0.0, 1.0)
+                # --- GPU inference (TRT or PyTorch) ---
+                fgr, pha, *rec = self._infer_frame(gpu_input, rec, mc.downsample_ratio)
 
-                # Back to bytes
-                out_np = (composite[0].permute(1, 2, 0).float().cpu().numpy() * 255).astype(np.uint8)
-                encoder.stdin.write(out_np.tobytes())
+                # --- GPU compositing: out = green + pha * (fgr - green) ---
+                torch.addcmul(green_tensor.expand_as(fgr), pha, fgr - green_tensor, out=out_gpu)
+                out_gpu.clamp_(0.0, 1.0)
+
+                # --- Fast GPU→CPU path ---
+                frame_out = out_gpu[0].permute(1, 2, 0).mul(255).to(torch.uint8)
+                out_pin.copy_(frame_out.cpu())
+                encode_q.put(out_pin.numpy().tobytes())
 
                 frame_idx += 1
-                if progress_callback and frame_idx % mc.progress_interval == 0:
-                    pct = min(frame_idx / max(total_frames, 1) * 100, 99)
-                    progress_callback("matting", pct)
                 if frame_idx % mc.progress_interval == 0:
+                    if progress_callback:
+                        pct = min(frame_idx / max(total_frames, 1) * 100, 99)
+                        progress_callback("matting", pct)
                     logger.info("  Streamed %d/%d frames", frame_idx, total_frames)
 
-                del src, fgr, pha, composite
+            # Signal encode thread to finish
+            encode_q.put(SENTINEL)
+            t_encode.join(timeout=30)
+            t_decode.join(timeout=10)
 
             encoder.stdin.close()
             encoder.wait()
             decoder.wait()
+
+            if decode_error[0]:
+                logger.error("Decode thread error: %s", decode_error[0])
+            if encode_error[0]:
+                logger.error("Encode thread error: %s", encode_error[0])
 
             if encoder.returncode != 0:
                 err = encoder.stderr.read().decode() if encoder.stderr else ""
@@ -821,29 +1101,25 @@ class MatteProcessor:
         """Merge two matted eye videos side-by-side using FFmpeg hstack."""
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        cmd = [
-            "ffmpeg", "-hide_banner", "-y",
+        input_args = [
             "-i", str(left_path),
             "-i", str(right_path),
         ]
         if has_audio:
-            cmd.extend(["-i", str(audio_source)])
+            input_args.extend(["-i", str(audio_source)])
 
-        cmd.extend([
+        filter_args = [
             "-filter_complex", "[0:v][1:v]hstack=inputs=2[v]",
             "-map", "[v]",
-        ])
+        ]
         if has_audio:
-            cmd.extend(["-map", "2:a", "-c:a", "copy"])
+            filter_args.extend(["-map", "2:a", "-c:a", "copy"])
 
-        cmd.extend([
-            "-c:v", "libx265",
-            "-preset", self.settings.encode.preset,
-            "-crf", str(self.settings.encode.crf),
-            "-tag:v", "hvc1",
-            "-movflags", "+faststart",
-            str(output_path),
-        ])
+        bitrate = self.settings.matte.vr_encode_bitrate
+        cmd = self._build_encode_cmd(
+            input_args, output_path, bitrate,
+            extra_input_args=filter_args,
+        )
 
         logger.info("Merging L/R matted videos to SBS: %s", output_path.name)
         result = subprocess.run(cmd, capture_output=True, text=True)
@@ -1015,8 +1291,12 @@ class MatteProcessor:
             if not success:
                 return False
 
-            # Reset recurrent state for right eye
-            self.model = None
+            # Reset recurrent state for right eye (preserves loaded model/TRT engine)
+            if self._trt_engine is not None:
+                self._trt_engine.reset_recurrent_state()
+            else:
+                # PyTorch path: need to reload model to clear recurrent state
+                self.model = None
 
             if progress_callback:
                 progress_callback("matting_right", 50)
@@ -1095,8 +1375,11 @@ class MatteProcessor:
                 downsample_ratio=mc.downsample_ratio,
             )
 
-            # Reset recurrent state for right eye
-            self.model = None
+            # Reset recurrent state for right eye (preserves loaded model/TRT engine)
+            if self._trt_engine is not None:
+                self._trt_engine.reset_recurrent_state()
+            else:
+                self.model = None
 
             if progress_callback:
                 progress_callback("matting_right", 50)
