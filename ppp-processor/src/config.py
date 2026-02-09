@@ -23,6 +23,7 @@ class PathsConfig(BaseSettings):
     models_dir: str = "./bin/models"
     realesrgan_bin: str = "./bin/realesrgan-ncnn-vulkan"
     analysis_dir: str = "../ppp_analysis"
+    local_cache_dir: str = ""  # Local SSD cache for network files (empty = disabled)
 
 
 class GPUConfig(BaseSettings):

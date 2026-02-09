@@ -7,6 +7,7 @@ output verification, and post-processing (Stash/Jellyfin).
 from __future__ import annotations
 
 import logging
+import shutil
 import time
 from pathlib import Path
 
@@ -17,6 +18,45 @@ from src.config import get_settings
 from src.database import JobDatabase
 
 logger = logging.getLogger("ppp.worker.local")
+
+
+def _cache_to_local(source_path: Path, cache_dir: str) -> tuple[Path, bool]:
+    """Copy a network file to local SSD cache for faster I/O + NVDEC.
+
+    Returns (local_path, was_cached). If cache_dir is empty or source is
+    already local, returns the original path with was_cached=False.
+    """
+    if not cache_dir:
+        return source_path, False
+
+    # Skip if already on a local drive (not a UNC path or mapped network drive)
+    drive = source_path.drive
+    if drive and drive[0] not in ("M", "N", "\\"):
+        return source_path, False
+
+    cache = Path(cache_dir)
+    cache.mkdir(parents=True, exist_ok=True)
+    local_path = cache / source_path.name
+
+    if local_path.exists() and local_path.stat().st_size == source_path.stat().st_size:
+        logger.info("Cache hit: %s", local_path)
+        return local_path, True
+
+    size_mb = source_path.stat().st_size / 1024 / 1024
+    logger.info("Caching %.0f MB to local SSD: %s -> %s", size_mb, source_path.name, local_path)
+    shutil.copy2(source_path, local_path)
+    logger.info("Cache copy complete: %s", local_path.name)
+    return local_path, True
+
+
+def _cleanup_cache(local_path: Path, was_cached: bool):
+    """Remove a cached local copy after processing."""
+    if was_cached and local_path.exists():
+        try:
+            local_path.unlink()
+            logger.info("Cleaned cache: %s", local_path.name)
+        except PermissionError:
+            logger.warning("Cache file still locked, will be cleaned next run: %s", local_path.name)
 
 
 class LocalGPUTask(Task):
@@ -63,6 +103,10 @@ def process_job(self: LocalGPUTask, job_id: str):
     worker_id = f"local-{self.request.hostname}" if self.request.hostname else "local-0"
     start_time = time.time()
 
+    # Cache network file to local SSD for faster I/O + NVDEC support
+    settings = self.settings
+    local_source, was_cached = _cache_to_local(source_path, settings.paths.local_cache_dir)
+
     def progress_callback(stage: str, percent: float):
         self.update_state(
             state="PROGRESS",
@@ -74,10 +118,9 @@ def process_job(self: LocalGPUTask, job_id: str):
         )
 
     try:
-        # Analyze video
-        settings = self.settings
+        # Analyze video (use local cached copy for I/O speed)
         analyzer = VideoAnalyzer(settings)
-        info = analyzer.probe_video(source_path)
+        info = analyzer.probe_video(local_source)
 
         # Override VR detection from job if specified
         if job.get("is_vr") and not info.is_vr:
@@ -99,11 +142,11 @@ def process_job(self: LocalGPUTask, job_id: str):
             matte_proc = MatteProcessor(settings)
             if info.is_vr and info.vr_type == "sbs":
                 success = matte_proc.process_vr_sbs(
-                    source_path, output_path, info, progress_callback,
+                    local_source, output_path, info, progress_callback,
                 )
             else:
                 success = matte_proc.process_video(
-                    source_path, output_path, info, progress_callback,
+                    local_source, output_path, info, progress_callback,
                 )
 
             processing_time = time.time() - start_time
@@ -155,9 +198,9 @@ def process_job(self: LocalGPUTask, job_id: str):
             pipeline = ProcessingPipeline(settings)
 
             if info.is_vr and info.vr_type == "sbs":
-                success = pipeline.run(source_path, output_path, plan, info, progress_callback)
+                success = pipeline.run(local_source, output_path, plan, info, progress_callback)
             else:
-                success = pipeline.run(source_path, output_path, plan, info, progress_callback)
+                success = pipeline.run(local_source, output_path, plan, info, progress_callback)
 
             processing_time = time.time() - start_time
 
@@ -192,7 +235,7 @@ def process_job(self: LocalGPUTask, job_id: str):
         )
 
         qa = QAValidator(settings, self.db)
-        sample = qa.process_sample(source_path, job_id, plan, info)
+        sample = qa.process_sample(local_source, job_id, plan, info)
 
         if sample.auto_approved is True:
             # Auto-approved — proceed to full processing
@@ -223,7 +266,7 @@ def process_job(self: LocalGPUTask, job_id: str):
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         pipeline = ProcessingPipeline(settings)
-        success = pipeline.run(source_path, output_path, plan, info, progress_callback)
+        success = pipeline.run(local_source, output_path, plan, info, progress_callback)
 
         processing_time = time.time() - start_time
 
@@ -272,6 +315,9 @@ def process_job(self: LocalGPUTask, job_id: str):
             error=error_msg, processing_time=processing_time,
         )
         return {"status": "failed", "error": error_msg}
+
+    finally:
+        _cleanup_cache(local_source, was_cached)
 
 
 def _post_process(settings, job: dict, output_path: Path, info):

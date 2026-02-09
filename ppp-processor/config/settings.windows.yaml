@@ -7,6 +7,7 @@ paths:
   models_dir: "C:\\ppp-processor\\ppp-processor\\bin\\models"
   realesrgan_bin: "C:\\ppp-processor\\ppp-processor\\bin\\realesrgan-ncnn-vulkan.exe"
   analysis_dir: "C:\\ppp-processor\\ppp-processor\\ppp_analysis"
+  local_cache_dir: "C:\\ppp-processor\\cache"
 
 path_maps:
   - linux: "/home/jtk1234/media-drive1"
@@ -36,3 +37,9 @@ encode:
   nvenc_preset: "p5"
   tune: "hq"
   rc_mode: "constqp"
+
+tensorrt:
+  enabled: true
+  cache_dir: "C:\\ppp-processor\\trt_engines"
+  fp16: true
+  max_workspace_mb: 4096
