@@ -65,6 +65,30 @@ class ResolutionBucket:
                 self.min_w <= w <= self.max_w)
 
 
+def _make_export_wrapper(model, downsample_ratio: float = 0.25):
+    """Create a wrapper module that bakes downsample_ratio as a constant.
+
+    RVM's forward() uses `if downsample_ratio != 1:` which is a Python branch.
+    Passing downsample_ratio as a tensor input breaks F.interpolate(scale_factor=...).
+    This wrapper stores it as a plain Python float so JIT tracing works correctly.
+    """
+    torch = _import_torch()
+
+    class _RVMExportWrapper(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = model
+            self.downsample_ratio = downsample_ratio
+
+        def forward(self, src, r1=None, r2=None, r3=None, r4=None):
+            fgr, pha, *rec = self.model(
+                src, r1, r2, r3, r4, self.downsample_ratio, False,
+            )
+            return fgr, pha, rec[0], rec[1], rec[2], rec[3]
+
+    return _RVMExportWrapper()
+
+
 class RVMTensorRTEngine:
     """TensorRT engine for RobustVideoMatting with recurrent state.
 
@@ -105,6 +129,11 @@ class RVMTensorRTEngine:
     ) -> Path:
         """Export PyTorch RVM model to ONNX format with dynamic axes.
 
+        Uses a wrapper to bake downsample_ratio as a Python float constant
+        (not a tensor input) because F.interpolate(scale_factor=...) requires
+        a float, and the JIT tracer would convert a tensor input to a traced
+        value that breaks F.interpolate.
+
         Only needs to run once per model type.
         """
         torch = _import_torch()
@@ -120,15 +149,27 @@ class RVMTensorRTEngine:
         # Use float32 for ONNX export regardless of runtime precision
         model_f32 = pytorch_model.float()
 
-        # Dummy inputs for tracing
-        dummy_src = torch.randn(1, 3, 1080, 1920, device=device, dtype=torch.float32)
-        dummy_r1 = torch.zeros(1, 1, 1, 1, device=device, dtype=torch.float32)
-        dummy_r2 = torch.zeros(1, 1, 1, 1, device=device, dtype=torch.float32)
-        dummy_r3 = torch.zeros(1, 1, 1, 1, device=device, dtype=torch.float32)
-        dummy_r4 = torch.zeros(1, 1, 1, 1, device=device, dtype=torch.float32)
-        dummy_dr = torch.tensor([downsample_ratio], device=device, dtype=torch.float32)
+        # Wrap model to bake downsample_ratio as constant and flatten outputs
+        wrapper = _make_export_wrapper(model_f32, downsample_ratio)
 
-        input_names = ["src", "r1i", "r2i", "r3i", "r4i", "downsample_ratio"]
+        # Run a forward pass with None recurrent states to get their shapes.
+        # The ConvGRU allocates zero tensors matching the encoder spatial dims.
+        dummy_src = torch.randn(1, 3, 1080, 1920, device=device, dtype=torch.float32)
+        with torch.no_grad():
+            _, _, r1_init, r2_init, r3_init, r4_init = wrapper(
+                dummy_src, None, None, None, None,
+            )
+        logger.info("Recurrent state shapes: r1=%s r2=%s r3=%s r4=%s",
+                     list(r1_init.shape), list(r2_init.shape),
+                     list(r3_init.shape), list(r4_init.shape))
+
+        # Use the actual recurrent state shapes as dummy inputs for tracing
+        dummy_r1 = torch.zeros_like(r1_init)
+        dummy_r2 = torch.zeros_like(r2_init)
+        dummy_r3 = torch.zeros_like(r3_init)
+        dummy_r4 = torch.zeros_like(r4_init)
+
+        input_names = ["src", "r1i", "r2i", "r3i", "r4i"]
         output_names = ["fgr", "pha", "r1o", "r2o", "r3o", "r4o"]
 
         # Dynamic axes for spatial dimensions and recurrent state
@@ -146,27 +187,44 @@ class RVMTensorRTEngine:
             "r4o": {0: "batch", 1: "r4c", 2: "r4h", 3: "r4w"},
         }
 
+        # Use legacy JIT-based exporter (dynamo=False) because RVM has
+        # data-dependent branches (if downsample_ratio != 1) that torch.export
+        # cannot trace. The JIT tracer records the actual execution path.
         torch.onnx.export(
-            model_f32,
-            (dummy_src, dummy_r1, dummy_r2, dummy_r3, dummy_r4, dummy_dr),
+            wrapper,
+            (dummy_src, dummy_r1, dummy_r2, dummy_r3, dummy_r4),
             str(onnx_path),
             input_names=input_names,
             output_names=output_names,
             dynamic_axes=dynamic_axes,
             opset_version=17,
             do_constant_folding=True,
+            dynamo=False,
         )
 
         logger.info("ONNX export complete: %s (%.1f MB)",
                      onnx_path.name, onnx_path.stat().st_size / 1024 / 1024)
         return onnx_path
 
+    def _discover_rec_shapes(self, pytorch_model, device, h: int, w: int,
+                             downsample_ratio: float = 0.25):
+        """Run a forward pass to discover recurrent state shapes for a resolution."""
+        torch = _import_torch()
+        # Use float32 model for shape discovery (shapes are dtype-independent)
+        model_f32 = pytorch_model.float()
+        wrapper = _make_export_wrapper(model_f32, downsample_ratio)
+        dummy = torch.randn(1, 3, h, w, device=device, dtype=torch.float32)
+        with torch.no_grad():
+            _, _, r1, r2, r3, r4 = wrapper(dummy, None, None, None, None)
+        return [tuple(r.shape) for r in [r1, r2, r3, r4]]
+
     def build_engine(self, onnx_path: Path, bucket: ResolutionBucket,
-                     model_type: str) -> Path:
+                     model_type: str, pytorch_model=None, device=None) -> Path:
         """Build a TRT engine for a specific resolution bucket.
 
         Uses optimization profiles with min/opt/max shapes.
         Caches to disk for fast reload (~2s vs ~30s compile).
+        pytorch_model is needed on first build to discover recurrent state shapes.
         """
         trt = _import_trt()
         torch = _import_torch()
@@ -179,9 +237,20 @@ class RVMTensorRTEngine:
             logger.info("TRT engine cached: %s", engine_path)
             return engine_path
 
+        if pytorch_model is None or device is None:
+            raise RuntimeError("pytorch_model and device required for first engine build")
+
         logger.info("Building TRT engine for bucket '%s' (%dx%d opt)...",
                      bucket.name, bucket.opt_w, bucket.opt_h)
         start = time.time()
+
+        # Discover recurrent state shapes at min/opt/max resolutions
+        shapes_min = self._discover_rec_shapes(pytorch_model, device, bucket.min_h, bucket.min_w)
+        shapes_opt = self._discover_rec_shapes(pytorch_model, device, bucket.opt_h, bucket.opt_w)
+        shapes_max = self._discover_rec_shapes(pytorch_model, device, bucket.max_h, bucket.max_w)
+        for i, name in enumerate(["r1", "r2", "r3", "r4"]):
+            logger.info("  %s shapes: min=%s opt=%s max=%s",
+                         name, shapes_min[i], shapes_opt[i], shapes_max[i])
 
         trt_logger = trt.Logger(trt.Logger.WARNING)
         builder = trt.Builder(trt_logger)
@@ -215,17 +284,9 @@ class RVMTensorRTEngine:
                           (1, 3, bucket.opt_h, bucket.opt_w),
                           (1, 3, bucket.max_h, bucket.max_w))
 
-        # Recurrent state inputs: dynamic shapes
-        # First frame: [1,1,1,1], subsequent: resolution-dependent
-        # We use generous ranges to accommodate both
-        for ri in ["r1i", "r2i", "r3i", "r4i"]:
-            profile.set_shape(ri,
-                              (1, 1, 1, 1),
-                              (1, 64, bucket.opt_h // 4, bucket.opt_w // 4),
-                              (1, 128, bucket.max_h // 2, bucket.max_w // 2))
-
-        # downsample_ratio: scalar tensor
-        profile.set_shape("downsample_ratio", (1,), (1,), (1,))
+        # Recurrent state inputs: use shapes discovered from forward passes
+        for i, ri in enumerate(["r1i", "r2i", "r3i", "r4i"]):
+            profile.set_shape(ri, shapes_min[i], shapes_opt[i], shapes_max[i])
 
         config.add_optimization_profile(profile)
 
@@ -306,25 +367,44 @@ class RVMTensorRTEngine:
             # Export ONNX if needed
             onnx_path = self.export_onnx(pytorch_model, model_type, device)
 
-            # Build or load engine
-            engine_path = self.build_engine(onnx_path, bucket, model_type)
+            # Build or load engine (pass model for shape discovery on first build)
+            engine_path = self.build_engine(onnx_path, bucket, model_type,
+                                            pytorch_model, device)
             self.load_engine(engine_path)
 
             self._current_bucket = bucket
-            self.reset_recurrent_state()
+            self.reset_recurrent_state(height, width, pytorch_model, device)
             return True
 
         except Exception as e:
             logger.error("TRT preparation failed, falling back to PyTorch: %s", e)
             return False
 
-    def reset_recurrent_state(self):
-        """Clear recurrent state — needed for VR eye switch or new video."""
+    def reset_recurrent_state(self, height: int = 0, width: int = 0,
+                              pytorch_model=None, device=None):
+        """Clear recurrent state — needed for VR eye switch or new video.
+
+        If height/width/pytorch_model are provided, discovers the correct
+        shapes via a forward pass. Otherwise uses cached shapes from prepare().
+        """
         torch = _import_torch()
+        dtype = torch.float16 if self.trt_config.fp16 else torch.float32
+
+        if height > 0 and width > 0 and pytorch_model is not None and device is not None:
+            shapes = self._discover_rec_shapes(pytorch_model, device, height, width)
+            self._initial_rec_shapes = shapes
+        elif hasattr(self, "_initial_rec_shapes") and self._initial_rec_shapes:
+            shapes = self._initial_rec_shapes
+        else:
+            # Fallback: will be corrected on first inference
+            self._rec_states = [
+                torch.zeros(1, 1, 1, 1, dtype=dtype, device="cuda")
+                for _ in range(4)
+            ]
+            return
+
         self._rec_states = [
-            torch.zeros(1, 1, 1, 1, dtype=torch.float16 if self.trt_config.fp16 else torch.float32,
-                        device="cuda")
-            for _ in range(4)
+            torch.zeros(s, dtype=dtype, device="cuda") for s in shapes
         ]
 
     def infer(self, src_tensor, downsample_ratio: float = 0.25):
@@ -352,10 +432,6 @@ class RVMTensorRTEngine:
         self._context.set_input_shape("src", src.shape)
         for i, ri in enumerate(["r1i", "r2i", "r3i", "r4i"]):
             self._context.set_input_shape(ri, tuple(self._rec_states[i].shape))
-        self._context.set_input_shape("downsample_ratio", (1,))
-
-        # Prepare downsample_ratio tensor
-        dr_tensor = torch.tensor([downsample_ratio], dtype=dtype, device="cuda")
 
         # Allocate output buffers
         # fgr and pha have same spatial dims as src
@@ -369,7 +445,6 @@ class RVMTensorRTEngine:
         self._context.set_tensor_address("src", src.data_ptr())
         for i, ri in enumerate(["r1i", "r2i", "r3i", "r4i"]):
             self._context.set_tensor_address(ri, self._rec_states[i].data_ptr())
-        self._context.set_tensor_address("downsample_ratio", dr_tensor.data_ptr())
 
         # Bind outputs
         self._context.set_tensor_address("fgr", fgr.data_ptr())

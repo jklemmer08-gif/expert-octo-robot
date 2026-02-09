@@ -18,7 +18,17 @@ app = Celery(
 
 def _configure_celery():
     """Apply settings to Celery. Called lazily to avoid import-time YAML parse."""
+    import os
+    import platform
     settings = get_settings()
+
+    # Ensure FFmpeg binaries are on PATH (bin/ lives next to models_dir)
+    if platform.system() == "Windows":
+        from pathlib import Path
+        bin_dir = str(Path(settings.paths.models_dir).parent)
+        if bin_dir not in os.environ.get("PATH", ""):
+            os.environ["PATH"] = bin_dir + os.pathsep + os.environ.get("PATH", "")
+
     app.conf.update(
         broker_url=settings.redis.url,
         result_backend=settings.redis.url,

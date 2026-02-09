@@ -16,6 +16,7 @@ import logging
 import re
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -554,6 +555,49 @@ class MatteProcessor:
             logger.info("NVENC unavailable, will use %s", self.settings.encode.fallback_encoder)
         return self._nvenc_available
 
+    def _check_pynvvideocodec(self) -> bool:
+        """Check if PyNvVideoCodec is available for GPU-resident decode."""
+        if hasattr(self, "_pynvc_available"):
+            return self._pynvc_available
+        try:
+            import os as _os
+            torch, _, _ = _import_torch()
+            torch_lib = _os.path.join(_os.path.dirname(torch.__file__), "lib")
+            _os.add_dll_directory(torch_lib)
+            import PyNvVideoCodec  # noqa: F401
+            self._pynvc_available = True
+            logger.info("PyNvVideoCodec available — GPU-resident pipeline enabled")
+        except (ImportError, OSError) as e:
+            self._pynvc_available = False
+            logger.info("PyNvVideoCodec unavailable — using FFmpeg pipes: %s", e)
+        return self._pynvc_available
+
+    @staticmethod
+    def _rgb_chw_to_nv12_gpu(rgb):
+        """Convert CHW RGB uint8 CUDA tensor to NV12 on GPU (BT.601).
+
+        Returns a flat uint8 CUDA tensor: Y plane (H*W) + interleaved UV (H/2*W).
+        Total size = H * W * 1.5 bytes.
+        """
+        torch, _, _ = _import_torch()
+        r = rgb[0].float()
+        g = rgb[1].float()
+        b = rgb[2].float()
+        # Y plane (full resolution)
+        y = (0.299 * r + 0.587 * g + 0.114 * b).clamp(0, 255).to(torch.uint8)
+        # UV plane (subsampled 2x2)
+        r_sub = r[0::2, 0::2]
+        g_sub = g[0::2, 0::2]
+        b_sub = b[0::2, 0::2]
+        u = (-0.169 * r_sub - 0.331 * g_sub + 0.500 * b_sub + 128).clamp(0, 255).to(torch.uint8)
+        v = (0.500 * r_sub - 0.419 * g_sub - 0.081 * b_sub + 128).clamp(0, 255).to(torch.uint8)
+        # Interleave U and V for NV12
+        h2, w2 = u.shape
+        uv = torch.empty(h2, w2 * 2, dtype=torch.uint8, device=rgb.device)
+        uv[:, 0::2] = u
+        uv[:, 1::2] = v
+        return torch.cat([y.reshape(-1), uv.reshape(-1)])
+
     def _build_encode_cmd(
         self,
         input_args: list,
@@ -702,7 +746,8 @@ class MatteProcessor:
         # torch.compile() for fused kernels
         # reduce-overhead mode requires Triton which is unavailable on Windows;
         # the compile() call itself succeeds but the first forward pass fails.
-        # On Windows, go straight to inductor/eager; on Linux try reduce-overhead.
+        # On Windows with FP16, torch.compile(eager) causes dtype mismatch
+        # (bias float32 vs input float16) during Dynamo tracing — skip it.
         import platform as _platform
         if self.device.type == "cuda":
             if _platform.system() != "Windows":
@@ -715,12 +760,14 @@ class MatteProcessor:
                         logger.info("torch.compile() enabled (eager backend)")
                     except Exception as e:
                         logger.info("torch.compile() unavailable: %s", e)
-            else:
+            elif not self._use_fp16:
                 try:
                     self.model = torch.compile(self.model, backend="eager")
                     logger.info("torch.compile() enabled (eager backend — Windows)")
                 except Exception as e:
                     logger.info("torch.compile() unavailable on Windows: %s", e)
+            else:
+                logger.info("Skipping torch.compile() on Windows with FP16 (Dynamo dtype conflict)")
 
     def _prepare_inference_engine(self, height: int, width: int):
         """Prepare TensorRT engine for the given resolution if enabled.
@@ -755,6 +802,12 @@ class MatteProcessor:
         except Exception as e:
             logger.warning("TRT init error, falling back to PyTorch: %s", e)
             self._trt_engine = None
+
+        # ONNX export calls model.float() which mutates in-place — restore FP16
+        if self._use_fp16 and self.model is not None:
+            torch, _, _ = _import_torch()
+            self.model = self.model.half()
+            logger.info("Restored model to FP16 after TRT preparation")
 
     def _infer_frame(self, gpu_input, rec, downsample_ratio):
         """Dispatch inference to TRT or PyTorch.
@@ -831,6 +884,241 @@ class MatteProcessor:
 
         logger.info("Matting complete: %d frames", total)
         return True
+
+    def _process_video_gpu_resident(
+        self,
+        input_path: Path,
+        output_path: Path,
+        probe: dict,
+        crop_region: Optional[tuple] = None,
+        bitrate: str = "15M",
+        progress_callback: ProgressCallback = None,
+    ) -> bool:
+        """GPU-resident matte: PyNvVideoCodec decode → GPU infer → FFmpeg NVENC.
+
+        Eliminates FFmpeg pipe decode bottleneck by decoding directly to GPU
+        memory (zero-copy via DLPack). Encode uses FFmpeg with NV12 pipe input
+        (12 MB/frame at 4K vs 25 MB with RGB24).
+
+        Returns True on success, False on failure.
+        """
+        import os as _os
+        import queue
+        import threading
+
+        torch, transforms, np = _import_torch()
+
+        # Import PyNvVideoCodec (add DLL path for cudart64_12.dll)
+        torch_lib = _os.path.join(_os.path.dirname(torch.__file__), "lib")
+        if _os.path.isdir(torch_lib):
+            _os.add_dll_directory(torch_lib)
+        import PyNvVideoCodec as nvc
+
+        mc = self.settings.matte
+        src_w, src_h = probe["width"], probe["height"]
+        fps_str = probe["fps_str"]
+        total_frames = probe["total_frames"]
+
+        if self.model is None:
+            self._load_model(mc.model_type)
+
+        # Determine processing dimensions
+        if crop_region:
+            cx, cy, cw, ch = crop_region
+            proc_w, proc_h = cw, ch
+        else:
+            cx, cy = 0, 0
+            proc_w, proc_h = src_w, src_h
+
+        # Skip TRT in GPU-resident path — PyNvVideoCodec's CUDA context
+        # conflicts with TRT's context, causing illegal memory access.
+        # PyTorch FP16 inference is sufficient (20+ fps at 4K).
+        self._trt_engine = None
+
+        dtype = torch.float16 if getattr(self, "_use_fp16", False) else torch.float32
+
+        # Pre-allocate GPU buffers
+        green = mc.green_color
+        green_tensor = torch.tensor(
+            [[[green[0] / 255.0]], [[green[1] / 255.0]], [[green[2] / 255.0]]],
+            dtype=dtype, device=self.device,
+        )
+        gpu_input = torch.empty((1, 3, proc_h, proc_w), dtype=dtype, device=self.device)
+        out_gpu = torch.empty((1, 3, proc_h, proc_w), dtype=dtype, device=self.device)
+
+        # NV12 pinned output buffer for fast GPU→CPU transfer
+        nv12_size = proc_w * proc_h * 3 // 2
+        nv12_pin = torch.empty(nv12_size, dtype=torch.uint8).pin_memory()
+
+        # --- FFmpeg encode pipe (NV12 input → NVENC) ---
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        pipe_input_args = [
+            "-f", "rawvideo", "-pix_fmt", "nv12",
+            "-s", f"{proc_w}x{proc_h}", "-r", fps_str,
+            "-i", "pipe:0",
+        ]
+        audio_args = None
+        if probe["has_audio"]:
+            audio_args = [
+                "-i", str(input_path),
+                "-map", "0:v", "-map", "1:a", "-c:a", "copy",
+            ]
+        encode_cmd = self._build_encode_cmd(
+            pipe_input_args, output_path, bitrate,
+            extra_input_args=audio_args,
+        )
+
+        pipe_bufsize = nv12_size * 8
+
+        # --- Async encode thread ---
+        SENTINEL = None
+        encode_q: queue.Queue = queue.Queue(maxsize=4)
+        encode_error = [None]
+
+        encoder = subprocess.Popen(
+            encode_cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE,
+            bufsize=pipe_bufsize,
+        )
+
+        def encode_thread():
+            """Pull NV12 frame bytes from queue and write to FFmpeg pipe."""
+            try:
+                while True:
+                    data = encode_q.get()
+                    if data is SENTINEL:
+                        break
+                    encoder.stdin.write(data)
+            except Exception as e:
+                encode_error[0] = e
+
+        rec = [None] * 4
+        frame_idx = 0
+        t_start = time.time()
+
+        try:
+            # Start GPU decoder (RGBP = planar RGB → CHW uint8 on GPU)
+            decoder = nvc.SimpleDecoder(
+                str(input_path), gpu_id=0,
+                output_color_type=nvc.OutputColorType.RGBP,
+            )
+
+            # Start encode thread
+            t_encode = threading.Thread(target=encode_thread, daemon=True)
+            t_encode.start()
+
+            for frame in decoder:
+                # DLPack zero-copy GPU decode → torch CUDA tensor (CHW uint8)
+                frame_tensor = torch.from_dlpack(frame)
+
+                # Apply crop on GPU (tensor slice — effectively free)
+                if crop_region:
+                    frame_tensor = frame_tensor[:, cy:cy + ch, cx:cx + cw].contiguous()
+
+                # Convert to model input format (normalized float16/32)
+                gpu_input[0].copy_(frame_tensor.to(dtype))
+                gpu_input.div_(255.0)
+
+                # GPU inference (TRT or PyTorch)
+                fgr, pha, *rec = self._infer_frame(gpu_input, rec, mc.downsample_ratio)
+
+                # GPU compositing: out = green + pha * (fgr - green)
+                torch.addcmul(
+                    green_tensor.expand_as(fgr), pha,
+                    fgr - green_tensor, out=out_gpu,
+                )
+                out_gpu.clamp_(0.0, 1.0)
+
+                # Convert composite to uint8 CHW then GPU NV12
+                frame_out = out_gpu[0].mul(255).to(torch.uint8)
+                nv12_gpu = self._rgb_chw_to_nv12_gpu(frame_out)
+
+                # GPU→CPU via pinned memory
+                nv12_pin.copy_(nv12_gpu)
+                encode_q.put(nv12_pin.numpy().tobytes())
+
+                frame_idx += 1
+                if frame_idx % mc.progress_interval == 0:
+                    elapsed = time.time() - t_start
+                    fps_actual = frame_idx / max(elapsed, 0.1)
+                    if progress_callback:
+                        pct = min(frame_idx / max(total_frames, 1) * 100, 99)
+                        progress_callback("matting", pct)
+                    logger.info(
+                        "  GPU-resident: %d/%d frames (%.1f fps)",
+                        frame_idx, total_frames, fps_actual,
+                    )
+
+            # Signal encode thread to finish
+            encode_q.put(SENTINEL)
+            t_encode.join(timeout=30)
+
+            encoder.stdin.close()
+            encoder.wait()
+
+            if encode_error[0]:
+                logger.error("Encode thread error: %s", encode_error[0])
+
+            if encoder.returncode != 0:
+                err = encoder.stderr.read().decode() if encoder.stderr else ""
+                logger.error("GPU-resident encode failed: %s", err[-500:])
+                return False
+
+            elapsed = time.time() - t_start
+            fps_avg = frame_idx / max(elapsed, 0.1)
+            logger.info(
+                "GPU-resident matting complete: %d frames in %.1fs (%.1f fps avg)",
+                frame_idx, elapsed, fps_avg,
+            )
+            return True
+
+        except Exception as e:
+            logger.error("GPU-resident pipeline error: %s", e)
+            import traceback
+            logger.error(traceback.format_exc())
+            return False
+
+        finally:
+            if encoder and encoder.poll() is None:
+                encoder.kill()
+            if self.device and self.device.type == "cuda":
+                torch.cuda.empty_cache()
+
+    def _process_video_with_best_backend(
+        self,
+        input_path: Path,
+        output_path: Path,
+        probe: dict,
+        crop_region: Optional[tuple] = None,
+        bitrate: str = "15M",
+        progress_callback: ProgressCallback = None,
+    ) -> bool:
+        """Try GPU-resident pipeline, fall back to FFmpeg pipe streaming."""
+        if self._check_pynvvideocodec():
+            # Ensure model is loaded so self.device is set (without TRT)
+            if self.model is None:
+                self._load_model(self.settings.matte.model_type)
+            if self.device and self.device.type == "cuda":
+                try:
+                    success = self._process_video_gpu_resident(
+                        input_path, output_path, probe,
+                        crop_region=crop_region, bitrate=bitrate,
+                        progress_callback=progress_callback,
+                    )
+                    if success:
+                        return True
+                    logger.warning(
+                        "GPU-resident pipeline failed, falling back to FFmpeg pipes"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "GPU-resident pipeline error: %s — falling back to FFmpeg pipes", e,
+                    )
+
+        return self._process_video_streaming(
+            input_path, output_path, probe,
+            crop_region=crop_region, bitrate=bitrate,
+            progress_callback=progress_callback,
+        )
 
     def _process_video_streaming(
         self,
@@ -1175,7 +1463,7 @@ class MatteProcessor:
             progress_callback("probing", 1)
 
         probe = self._probe_video_pipe_info(input_path)
-        success = self._process_video_streaming(
+        success = self._process_video_with_best_backend(
             input_path, output_path, probe,
             bitrate=mc.encode_bitrate,
             progress_callback=progress_callback,
@@ -1294,7 +1582,7 @@ class MatteProcessor:
             if progress_callback:
                 progress_callback("matting_left", 5)
 
-            success = self._process_video_streaming(
+            success = self._process_video_with_best_backend(
                 input_path, left_tmp, probe,
                 crop_region=(0, 0, half_w, h),
                 bitrate=mc.vr_encode_bitrate,
@@ -1313,7 +1601,7 @@ class MatteProcessor:
             if progress_callback:
                 progress_callback("matting_right", 50)
 
-            success = self._process_video_streaming(
+            success = self._process_video_with_best_backend(
                 input_path, right_tmp, probe,
                 crop_region=(half_w, 0, half_w, h),
                 bitrate=mc.vr_encode_bitrate,
