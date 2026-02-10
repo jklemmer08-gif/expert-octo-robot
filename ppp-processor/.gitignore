@@ -5,3 +5,11 @@ temp/
 logs/
 *.egg-info/
 .env
+venv/
+work/
+jobs.db
+cache/
+trt_engines/
+bin/ffmpeg.exe
+bin/ffprobe.exe
+bin/realesrgan-ncnn-vulkan.exe

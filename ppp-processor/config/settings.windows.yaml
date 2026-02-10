@@ -22,8 +22,8 @@ redis:
   password: ""
 
 matte:
-  model_type: "mobilenetv3"
-  downsample_ratio: 0.25
+  model_type: "resnet50"
+  downsample_ratio: 0.4
   green_color: [0, 177, 64]
   output_type: "green_screen"
 
@@ -37,6 +37,12 @@ encode:
   nvenc_preset: "p5"
   tune: "hq"
   rc_mode: "constqp"
+
+runpod:
+  api_key: ""  # Set via RUNPOD_API_KEY env var
+  serverless_endpoint_id: ""  # Fill after creating endpoint
+  s3_bucket: "ppp-processor-media"
+  s3_region: "us-east-2"
 
 tensorrt:
   enabled: true

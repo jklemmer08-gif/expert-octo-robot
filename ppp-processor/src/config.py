@@ -94,6 +94,9 @@ class RunPodConfig(BaseSettings):
     fallback_gpu: str = "NVIDIA RTX 3090"
     max_cost_per_job: float = 5.00
     budget_total: float = 75.00
+    serverless_endpoint_id: str = ""
+    s3_bucket: str = "ppp-processor-media"
+    s3_region: str = "us-east-2"
 
 
 class RedisConfig(BaseSettings):
