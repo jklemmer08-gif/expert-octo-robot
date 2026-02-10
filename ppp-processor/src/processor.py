@@ -663,11 +663,10 @@ class MatteProcessor:
             raise ValueError(f"Unknown RVM model type: {model_type}")
 
         self.models_dir.mkdir(parents=True, exist_ok=True)
-        logger.info("Downloading RVM %s model...", model_type)
-        subprocess.run(
-            ["wget", "-q", "--show-progress", "-O", str(model_path), url],
-            check=True,
-        )
+        logger.info("Downloading RVM %s model from %s ...", model_type, url)
+        import urllib.request
+        urllib.request.urlretrieve(url, str(model_path))
+        logger.info("Downloaded RVM %s model to %s", model_type, model_path)
         return model_path
 
     def _probe_video_pipe_info(self, video_path: Path) -> dict:
@@ -690,13 +689,33 @@ class MatteProcessor:
             s.get("codec_type") == "audio" for s in data.get("streams", [])
         )
 
-        # Parse FPS from r_frame_rate (e.g. "30000/1001")
-        fps_str = video_stream.get("r_frame_rate", "30/1")
-        num, den = fps_str.split("/")
-        fps = float(num) / float(den) if float(den) != 0 else 30.0
-
+        # Parse FPS — prefer avg_frame_rate (actual content rate) over
+        # r_frame_rate (which can report field rate / timebase, e.g. 59.94
+        # for 29.97fps H.264 content, causing 2x speed output).
         duration = float(data.get("format", {}).get("duration", 0))
         nb_frames = video_stream.get("nb_frames")
+
+        avg_fps_str = video_stream.get("avg_frame_rate", "0/0")
+        r_fps_str = video_stream.get("r_frame_rate", "30/1")
+
+        def _parse_fps(s):
+            try:
+                n, d = s.split("/")
+                return float(n) / float(d) if float(d) != 0 else 0.0
+            except (ValueError, ZeroDivisionError):
+                return 0.0
+
+        avg_fps = _parse_fps(avg_fps_str)
+        r_fps = _parse_fps(r_fps_str)
+
+        # Use avg_frame_rate when it's valid (non-zero, reasonable)
+        if avg_fps > 1.0:
+            fps = avg_fps
+            fps_str = avg_fps_str
+        else:
+            fps = r_fps if r_fps > 0 else 30.0
+            fps_str = r_fps_str
+
         total_frames = int(nb_frames) if nb_frames else int(duration * fps)
 
         return {
@@ -833,6 +852,60 @@ class MatteProcessor:
         with torch.no_grad():
             fgr, pha, *rec_new = self.model(gpu_input, *rec, downsample_ratio)
         return fgr, pha, *rec_new
+
+    def _refine_alpha(self, pha, src):
+        """Refine raw alpha matte with guided filter, thresholding, and morphological close.
+
+        Args:
+            pha: [1, 1, H, W] float tensor on GPU — raw alpha matte
+            src: [1, 3, H, W] float tensor on GPU — source frame (guide for edge-aware filter)
+
+        Returns:
+            Refined pha tensor, same shape/dtype/device.
+        """
+        torch, _, _ = _import_torch()
+        F = torch.nn.functional
+        orig_dtype = pha.dtype
+
+        # Upcast to FP32 — guided filter math overflows in FP16
+        pha = pha.float()
+        src_f = src.float()
+
+        # --- Guided filter (edge-aware smoothing) ---
+        # Grayscale guide from source: I = 0.299R + 0.587G + 0.114B
+        I = src_f[:, 0:1] * 0.299 + src_f[:, 1:2] * 0.587 + src_f[:, 2:3] * 0.114
+
+        r = 8  # filter radius
+        eps = 1e-4
+        k = 2 * r + 1  # kernel size = 17
+
+        # Box filter via avg_pool2d (reflect-pad to avoid border shrinkage)
+        def box_filter(x):
+            return F.avg_pool2d(F.pad(x, [r, r, r, r], mode="reflect"), k, stride=1)
+
+        mean_I = box_filter(I)
+        mean_p = box_filter(pha)
+        corr_Ip = box_filter(I * pha)
+        var_I = box_filter(I * I) - mean_I * mean_I
+
+        cov_Ip = corr_Ip - mean_I * mean_p
+        a = cov_Ip / (var_I + eps)
+        b = mean_p - a * mean_I
+
+        pha = box_filter(a) * I + box_filter(b)
+
+        # --- Threshold clamping (suppress bleed, solidify foreground) ---
+        pha = pha.clamp(0.0, 1.0)
+        pha[pha < 0.05] = 0.0
+        pha[pha > 0.95] = 1.0
+
+        # --- Morphological close (fill small holes): dilate then erode ---
+        # Dilation: max_pool2d with 3x3 kernel
+        pha = F.max_pool2d(F.pad(pha, [1, 1, 1, 1], mode="reflect"), 3, stride=1)
+        # Erosion: negate, max_pool, negate
+        pha = -F.max_pool2d(F.pad(-pha, [1, 1, 1, 1], mode="reflect"), 3, stride=1)
+
+        return pha.to(orig_dtype)
 
     def matte_frames(
         self,
@@ -1092,27 +1165,38 @@ class MatteProcessor:
         bitrate: str = "15M",
         progress_callback: ProgressCallback = None,
     ) -> bool:
-        """Try GPU-resident pipeline, fall back to FFmpeg pipe streaming."""
+        """Try GPU-resident pipeline in-process, fall back to streaming.
+
+        GPU-resident uses PyNvVideoCodec for zero-copy GPU decode, which is
+        10-20x faster than the streaming FFmpeg-pipe path. Falls back to
+        streaming if PyNvVideoCodec is unavailable or encounters an error.
+        """
+        torch, _, _ = _import_torch()
+
         if self._check_pynvvideocodec():
-            # Ensure model is loaded so self.device is set (without TRT)
-            if self.model is None:
-                self._load_model(self.settings.matte.model_type)
-            if self.device and self.device.type == "cuda":
-                try:
-                    success = self._process_video_gpu_resident(
-                        input_path, output_path, probe,
-                        crop_region=crop_region, bitrate=bitrate,
-                        progress_callback=progress_callback,
-                    )
-                    if success:
-                        return True
-                    logger.warning(
-                        "GPU-resident pipeline failed, falling back to FFmpeg pipes"
-                    )
-                except Exception as e:
-                    logger.warning(
-                        "GPU-resident pipeline error: %s — falling back to FFmpeg pipes", e,
-                    )
+            try:
+                logger.info("GPU-resident pipeline: %s", input_path.name)
+                # TRT disabled inside _process_video_gpu_resident (CUDA context conflict)
+                success = self._process_video_gpu_resident(
+                    input_path, output_path, probe,
+                    crop_region=crop_region, bitrate=bitrate,
+                    progress_callback=progress_callback,
+                )
+                if success:
+                    return True
+                logger.warning("GPU-resident returned False, falling back to streaming")
+            except Exception as e:
+                logger.warning("GPU-resident failed (%s), falling back to streaming", e)
+                # Clean up CUDA state before fallback
+                torch.cuda.empty_cache()
+
+            # Clean up partial output so streaming path starts fresh
+            try:
+                if output_path.exists():
+                    output_path.unlink()
+                    logger.info("Deleted partial output: %s", output_path)
+            except OSError as e:
+                logger.warning("Could not delete partial output: %s", e)
 
         return self._process_video_streaming(
             input_path, output_path, probe,
