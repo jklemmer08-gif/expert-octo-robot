@@ -1,0 +1,26 @@
+# PPP Processor — Linux/Intel dependencies
+# No PyTorch, no ONNX Runtime — OpenVINO + infrastructure only
+
+# Inference
+openvino==2024.6.0
+
+# Image/video processing
+opencv-python-headless>=4.8.0
+numpy>=1.24.0
+Pillow>=9.0.0
+
+# Configuration
+pyyaml>=6.0
+pydantic>=2.0
+pydantic-settings>=2.0
+
+# Task queue
+celery[redis]>=5.3.0
+redis>=4.5.0
+
+# API server
+fastapi>=0.100.0
+uvicorn>=0.22.0
+
+# HTTP
+requests>=2.28.0

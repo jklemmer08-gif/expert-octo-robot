@@ -55,6 +55,9 @@ class EncodeConfig(BaseSettings):
     temporal_aq: bool = True
     rc_lookahead: int = 32
     profile: str = "main10"
+    # VAAPI (Intel) params
+    vaapi_device: str = "/dev/dri/renderD128"
+    vaapi_qp: int = 20
 
 
 class TensorRTConfig(BaseSettings):
@@ -122,13 +125,21 @@ class MatteConfig(BaseSettings):
     model_type: str = "mobilenetv3"  # "mobilenetv3" or "resnet50"
     downsample_ratio: float = 0.25  # Lower = faster, less accurate edges
     green_color: List[int] = Field(default_factory=lambda: [0, 177, 64])  # Heresphere default
-    output_type: str = "green_screen"  # "green_screen" or "alpha_matte"
+    output_type: str = "green_screen"  # "green_screen", "alpha_matte", or "alpha_pack"
     use_streaming: bool = True       # FFmpeg pipe streaming (False = legacy disk path)
     fp16: bool = True                # FP16 mixed precision on CUDA
     seq_chunk: int = 1               # Frames per forward pass (future batching)
     encode_bitrate: str = "15M"      # 2D matting output bitrate
     vr_encode_bitrate: str = "50M"   # VR matting output bitrate
     progress_interval: int = 100     # Report progress every N frames
+    refine_alpha: bool = False       # Edge refinement via guided filter + morph close
+    channels_last: bool = True       # NHWC memory format for tensor core acceleration
+    cuda_graphs_pytorch: bool = True # CUDA Graphs for PyTorch fallback (Windows)
+    # Intel/OpenVINO settings
+    openvino_device: str = "GPU"             # OpenVINO target device ("GPU", "CPU")
+    onnx_model_path: str = ""                # Explicit ONNX path (empty = auto-detect)
+    alpha_pack_scale: float = 0.4            # Matte downscale factor for corner packing
+    vaapi_device: str = "/dev/dri/renderD128"  # VAAPI render node for decode/encode
 
 
 class QAConfig(BaseSettings):

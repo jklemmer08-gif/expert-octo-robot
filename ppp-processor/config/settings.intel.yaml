@@ -1,0 +1,49 @@
+paths:
+  stash_url: "http://localhost:9999/graphql"
+  stash_api_key: ""
+  library_root: "/home/jtk1234/media-drive1"
+  output_dir: "/home/jtk1234/media-drive2/ppp-output"
+  temp_dir: "/mnt/staging/ppp/temp"
+  models_dir: "./bin/models"
+  realesrgan_bin: "./bin/realesrgan-ncnn-vulkan"
+  analysis_dir: "./ppp_analysis"
+  local_cache_dir: ""
+
+path_maps:
+  - linux: "/home/jtk1234/media-drive1"
+    windows: "M:\\"
+  - linux: "/home/jtk1234/media-drive2"
+    windows: "N:\\"
+
+redis:
+  host: "localhost"
+  port: 6379
+  db: 0
+  password: ""
+
+matte:
+  model_type: "resnet50"
+  downsample_ratio: 0.4
+  green_color: [0, 177, 64]
+  output_type: "alpha_pack"
+  refine_alpha: false
+  channels_last: false
+  cuda_graphs_pytorch: false
+  openvino_device: "GPU"
+  onnx_model_path: "./trt_engines/rvm_resnet50.onnx"
+  alpha_pack_scale: 0.4
+  vaapi_device: "/dev/dri/renderD128"
+
+encode:
+  codec: "hevc"
+  encoder: "hevc_vaapi"
+  fallback_encoder: "libx265"
+  crf: 20
+  preset: "medium"
+  qp: 20
+  vaapi_device: "/dev/dri/renderD128"
+
+tensorrt:
+  enabled: false
+  cache_dir: "./trt_engines"
+  fp16: false

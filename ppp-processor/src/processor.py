@@ -529,7 +529,22 @@ class MatteProcessor:
         self.model = None
         self.device = None
         self._trt_engine = None  # TensorRT engine (Phase 2)
+        self._ort_engine = None  # ONNX Runtime engine
+        self._openvino_engine = None  # OpenVINO engine (Intel)
         self._nvenc_available = None  # Cached NVENC probe result
+        self._vaapi_available = None  # Cached VAAPI probe result
+        self._platform = self._detect_platform()  # "nvidia", "intel", or "cpu"
+        # CUDA Graphs state (Windows PyTorch fallback)
+        self._cuda_graph = None
+        self._cuda_graph_input = None
+        self._cuda_graph_output_fgr = None
+        self._cuda_graph_output_pha = None
+        self._cuda_graph_rec_in = None
+        self._cuda_graph_rec_out = None
+        self._cuda_graph_frame_count = 0
+        # ORT benchmark state — auto-fallback to PyTorch if ORT is too slow
+        self._ort_frame_count = 0
+        self._ort_bench_start = None
 
     def _probe_nvenc(self) -> bool:
         """Test NVENC availability with a minimal encode. Caches result."""
@@ -554,6 +569,122 @@ class MatteProcessor:
         else:
             logger.info("NVENC unavailable, will use %s", self.settings.encode.fallback_encoder)
         return self._nvenc_available
+
+    @staticmethod
+    def _detect_platform() -> str:
+        """Detect GPU platform: 'nvidia', 'intel', or 'cpu'."""
+        import platform as _platform
+
+        if _platform.system() == "Windows":
+            return "nvidia"
+
+        # Linux: check for OpenVINO GPU support (Intel Arc)
+        if _platform.system() == "Linux":
+            try:
+                import openvino as ov
+                devices = ov.Core().available_devices
+                if "GPU" in devices:
+                    logger.info("Platform detected: intel (OpenVINO GPU available)")
+                    return "intel"
+            except ImportError:
+                pass
+
+            # Check for NVIDIA on Linux
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    return "nvidia"
+            except ImportError:
+                pass
+
+        return "cpu"
+
+    def _probe_vaapi(self) -> bool:
+        """Test VAAPI encoder availability with a minimal encode. Caches result."""
+        if self._vaapi_available is not None:
+            return self._vaapi_available
+
+        vaapi_device = self.settings.matte.vaapi_device
+        try:
+            result = subprocess.run(
+                [
+                    "ffmpeg", "-hide_banner", "-y",
+                    "-vaapi_device", vaapi_device,
+                    "-f", "lavfi", "-i", "nullsrc=s=256x256:d=0.1",
+                    "-vf", "format=nv12,hwupload",
+                    "-c:v", "hevc_vaapi", "-f", "null", "-",
+                ],
+                capture_output=True, text=True, timeout=10,
+            )
+            self._vaapi_available = result.returncode == 0
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            self._vaapi_available = False
+
+        if self._vaapi_available:
+            logger.info("VAAPI hardware encoder available (%s)", vaapi_device)
+        else:
+            logger.info("VAAPI unavailable, will use %s", self.settings.encode.fallback_encoder)
+        return self._vaapi_available
+
+    def _build_encode_cmd_vaapi(
+        self,
+        output_path: Path,
+        width: int,
+        height: int,
+        fps_str: str,
+        audio_source: Optional[Path] = None,
+        has_audio: bool = False,
+    ) -> list:
+        """Build FFmpeg VAAPI encode command for Intel GPUs.
+
+        Uses rawvideo RGB24 pipe input → VAAPI hwupload → hevc_vaapi.
+        Falls back to libx265 if VAAPI is unavailable.
+        """
+        ec = self.settings.encode
+        mc = self.settings.matte
+        vaapi_device = mc.vaapi_device
+
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
+
+        if self._probe_vaapi():
+            cmd.extend(["-vaapi_device", vaapi_device])
+            cmd.extend([
+                "-f", "rawvideo", "-pix_fmt", "rgb24",
+                "-s", f"{width}x{height}", "-r", fps_str,
+                "-i", "pipe:0",
+            ])
+            if has_audio and audio_source:
+                cmd.extend(["-i", str(audio_source)])
+            cmd.extend([
+                "-vf", "format=nv12,hwupload",
+                "-c:v", "hevc_vaapi",
+                "-qp", str(ec.vaapi_qp),
+                "-profile:v", "main",
+                "-tag:v", "hvc1",
+            ])
+            if has_audio and audio_source:
+                cmd.extend(["-map", "0:v", "-map", "1:a", "-c:a", "copy"])
+        else:
+            # Fallback to software encoder
+            cmd.extend([
+                "-f", "rawvideo", "-pix_fmt", "rgb24",
+                "-s", f"{width}x{height}", "-r", fps_str,
+                "-i", "pipe:0",
+            ])
+            if has_audio and audio_source:
+                cmd.extend(["-i", str(audio_source)])
+            cmd.extend([
+                "-c:v", ec.fallback_encoder,
+                "-preset", ec.preset,
+                "-crf", str(ec.crf),
+                "-pix_fmt", "yuv420p",
+                "-tag:v", "hvc1",
+            ])
+            if has_audio and audio_source:
+                cmd.extend(["-map", "0:v", "-map", "1:a", "-c:a", "copy"])
+
+        cmd.extend(["-movflags", "+faststart", str(output_path)])
+        return cmd
 
     def _check_pynvvideocodec(self) -> bool:
         """Check if PyNvVideoCodec is available for GPU-resident decode."""
@@ -762,6 +893,11 @@ class MatteProcessor:
             self.model = self.model.half()
             logger.info("FP16 enabled — model converted to half precision")
 
+        # channels_last (NHWC) memory format for ~15-20% tensor core speedup on Ampere+
+        if mc.channels_last and self.device.type == "cuda":
+            self.model = self.model.to(memory_format=torch.channels_last)
+            logger.info("channels_last memory format enabled")
+
         # torch.compile() for fused kernels
         # reduce-overhead mode requires Triton which is unavailable on Windows;
         # the compile() call itself succeeds but the first forward pass fails.
@@ -788,59 +924,202 @@ class MatteProcessor:
             else:
                 logger.info("Skipping torch.compile() on Windows with FP16 (Dynamo dtype conflict)")
 
-    def _prepare_inference_engine(self, height: int, width: int):
-        """Prepare TensorRT engine for the given resolution if enabled.
+    def _resolve_onnx_path(self) -> Optional[Path]:
+        """Find the ONNX model for OpenVINO inference.
 
-        Called at video start to select and load the correct TRT bucket.
-        Falls back to PyTorch if TRT is unavailable or fails.
+        Checks explicit config path first, then common locations.
         """
-        trt_cfg = self.settings.tensorrt
-        if not trt_cfg.enabled:
-            return
+        mc = self.settings.matte
+
+        # Explicit path from config
+        if mc.onnx_model_path:
+            p = Path(mc.onnx_model_path)
+            if p.exists():
+                return p
+
+        # Check TRT cache dir (where ORT exports ONNX)
+        trt_dir = Path(self.settings.tensorrt.cache_dir)
+        candidates = [
+            trt_dir / f"rvm_{mc.model_type}.onnx",
+            trt_dir / f"rvm_{mc.model_type}_dr040.onnx",
+            trt_dir / f"rvm_{mc.model_type}_dr025.onnx",
+        ]
+        for c in candidates:
+            if c.exists():
+                return c
+
+        # Check models dir
+        models_onnx = self.models_dir / f"rvm_{mc.model_type}.onnx"
+        if models_onnx.exists():
+            return models_onnx
+
+        return None
+
+    def _prepare_inference_engine(self, height: int, width: int):
+        """Prepare accelerated inference engine for the given resolution.
+
+        Priority:
+        - Intel: OpenVINO GPU (no PyTorch needed)
+        - NVIDIA: ORT (TRT EP → CUDA EP) → raw TRT → PyTorch fallback
+        """
+        mc = self.settings.matte
+
+        # 0. OpenVINO (Intel path — no PyTorch needed)
+        if self._platform == "intel" and self._openvino_engine is None:
+            try:
+                from src.openvino_engine import RVMOpenVINOEngine
+                engine = RVMOpenVINOEngine()
+
+                # Resolve ONNX model path
+                onnx_path = self._resolve_onnx_path()
+                if onnx_path and onnx_path.exists():
+                    success = engine.prepare(
+                        height, width, onnx_path,
+                        device=mc.openvino_device,
+                    )
+                    if success:
+                        self._openvino_engine = engine
+                        logger.info("OpenVINO engine ready for %dx%d", width, height)
+                        return
+                    else:
+                        logger.warning("OpenVINO prepare failed, falling back")
+                else:
+                    logger.warning("ONNX model not found at %s", onnx_path)
+            except ImportError:
+                logger.info("OpenVINO not installed, skipping")
+            except Exception as e:
+                logger.warning("OpenVINO init error: %s", e)
+
+        # NVIDIA path needs PyTorch
+        torch, _, _ = _import_torch()
 
         if self.model is None:
-            self._load_model(self.settings.matte.model_type)
+            self._load_model(mc.model_type)
 
-        try:
-            from src.trt_engine import RVMTensorRTEngine
-            if self._trt_engine is None:
-                self._trt_engine = RVMTensorRTEngine(self.settings)
+        # 1. Try ONNX Runtime first (manages CUDA context internally)
+        if self._ort_engine is None:
+            try:
+                from src.ort_engine import RVMOrtEngine
+                self._ort_engine = RVMOrtEngine()
+            except ImportError:
+                logger.info("onnxruntime not installed, skipping ORT")
+                self._ort_engine = None
 
-            success = self._trt_engine.prepare(
-                height, width, self.model,
-                self.settings.matte.model_type, self.device,
-            )
-            if success:
-                logger.info("TensorRT engine ready for %dx%d", width, height)
-            else:
-                logger.info("TRT preparation failed, using PyTorch")
+        if self._ort_engine is not None:
+            try:
+                cache_dir = Path(self.settings.tensorrt.cache_dir)
+                success = self._ort_engine.prepare(
+                    height, width, self.model,
+                    mc.model_type, self.device,
+                    downsample_ratio=mc.downsample_ratio,
+                    cache_dir=cache_dir,
+                )
+                # ONNX export may have changed model precision — always restore
+                if self._use_fp16 and self.model is not None:
+                    self.model = self.model.half()
+                    if mc.channels_last and self.device.type == "cuda":
+                        self.model = self.model.to(memory_format=torch.channels_last)
+                    logger.info("Restored model to FP16 after ORT preparation")
+
+                if success:
+                    logger.info("ORT engine ready for %dx%d", width, height)
+                    return
+                else:
+                    self._ort_engine = None
+            except Exception as e:
+                logger.warning("ORT init error: %s", e)
+                self._ort_engine = None
+
+        # 2. Fall back to raw TensorRT
+        trt_cfg = self.settings.tensorrt
+        if trt_cfg.enabled:
+            try:
+                from src.trt_engine import RVMTensorRTEngine
+                if self._trt_engine is None:
+                    self._trt_engine = RVMTensorRTEngine(self.settings)
+
+                success = self._trt_engine.prepare(
+                    height, width, self.model,
+                    mc.model_type, self.device,
+                )
+                if success:
+                    logger.info("TensorRT engine ready for %dx%d", width, height)
+                else:
+                    logger.info("TRT preparation failed, using PyTorch")
+                    self._trt_engine = None
+            except ImportError:
+                logger.info("TensorRT not installed, using PyTorch inference")
                 self._trt_engine = None
-        except ImportError:
-            logger.info("TensorRT not installed, using PyTorch inference")
-            self._trt_engine = None
-        except Exception as e:
-            logger.warning("TRT init error, falling back to PyTorch: %s", e)
-            self._trt_engine = None
+            except Exception as e:
+                logger.warning("TRT init error, falling back to PyTorch: %s", e)
+                self._trt_engine = None
 
         # ONNX export calls model.float() which mutates in-place — restore FP16
         if self._use_fp16 and self.model is not None:
-            torch, _, _ = _import_torch()
             self.model = self.model.half()
-            logger.info("Restored model to FP16 after TRT preparation")
+            if mc.channels_last and self.device.type == "cuda":
+                self.model = self.model.to(memory_format=torch.channels_last)
+            logger.info("Restored model to FP16 after engine preparation")
 
     def _infer_frame(self, gpu_input, rec, downsample_ratio):
-        """Dispatch inference to TRT or PyTorch.
+        """Dispatch inference to OpenVINO → ORT → TRT → PyTorch.
 
         Args:
-            gpu_input: [1, 3, H, W] tensor on device
+            gpu_input: [1, 3, H, W] tensor on device (torch) or NumPy array
             rec: list of 4 recurrent state tensors (or Nones)
             downsample_ratio: float
 
         Returns:
             (fgr, pha, *rec_new) — same signature as RVM forward
         """
+        # 0. OpenVINO (Intel path — input is NumPy, no PyTorch)
+        if self._openvino_engine is not None:
+            try:
+                # gpu_input may be NumPy array on Intel path
+                if hasattr(gpu_input, 'numpy'):
+                    src_np = gpu_input.numpy() if not hasattr(gpu_input, 'cpu') else gpu_input.cpu().numpy()
+                else:
+                    src_np = gpu_input
+                fgr, pha = self._openvino_engine.infer(src_np)
+                return fgr, pha, *rec
+            except Exception as e:
+                logger.warning("OpenVINO inference failed, falling back: %s", e)
+                self._openvino_engine = None
+
         torch, _, _ = _import_torch()
 
+        # 1. ONNX Runtime (manages CUDA context — safe with PyNvVideoCodec)
+        if self._ort_engine is not None:
+            try:
+                import time as _time
+                if self._ort_bench_start is None:
+                    self._ort_bench_start = _time.time()
+
+                fgr, pha = self._ort_engine.infer(gpu_input)
+                self._ort_frame_count += 1
+
+                # After 20 warm-up frames, check if ORT is fast enough.
+                # If below 5 fps at this point, PyTorch+CUDA Graphs will be faster.
+                if self._ort_frame_count == 20:
+                    elapsed = _time.time() - self._ort_bench_start
+                    ort_fps = 20 / elapsed if elapsed > 0 else 0
+                    logger.info("ORT benchmark: %.1f fps over 20 frames", ort_fps)
+                    if ort_fps < 5.0:
+                        logger.info(
+                            "ORT too slow (%.1f fps < 5.0) — switching to PyTorch+CUDA Graphs",
+                            ort_fps,
+                        )
+                        self._ort_engine.cleanup()
+                        self._ort_engine = None
+                        # Don't return — fall through to PyTorch path below
+
+                if self._ort_engine is not None:
+                    return fgr, pha, *rec
+            except Exception as e:
+                logger.warning("ORT inference failed, falling back: %s", e)
+                self._ort_engine = None
+
+        # 2. Raw TensorRT
         if self._trt_engine is not None:
             try:
                 return self._trt_engine.infer(gpu_input, downsample_ratio)
@@ -848,9 +1127,98 @@ class MatteProcessor:
                 logger.warning("TRT inference failed, falling back to PyTorch: %s", e)
                 self._trt_engine = None
 
-        # PyTorch fallback
+        # 3. PyTorch fallback (with optional CUDA Graphs on Windows)
+        import platform as _platform
+        mc = self.settings.matte
+        use_cuda_graphs = (
+            mc.cuda_graphs_pytorch
+            and self.device.type == "cuda"
+            and _platform.system() == "Windows"
+        )
+
+        if use_cuda_graphs:
+            return self._infer_pytorch_cuda_graph(gpu_input, rec, downsample_ratio)
+
         with torch.no_grad():
             fgr, pha, *rec_new = self.model(gpu_input, *rec, downsample_ratio)
+        return fgr, pha, *rec_new
+
+    def _infer_pytorch_cuda_graph(self, gpu_input, rec, downsample_ratio):
+        """PyTorch inference with CUDA Graph replay for reduced CPU overhead.
+
+        After frame 1 (when recurrent states have resolved to real shapes),
+        captures the inference as a CUDA Graph. Subsequent frames replay the
+        graph with zero CPU-side kernel launch overhead (~10-20% speedup).
+        """
+        torch, _, _ = _import_torch()
+
+        self._cuda_graph_frame_count += 1
+
+        # Frame 1: warm-up run to resolve recurrent state shapes
+        if self._cuda_graph_frame_count == 1:
+            with torch.no_grad():
+                fgr, pha, *rec_new = self.model(gpu_input, *rec, downsample_ratio)
+            return fgr, pha, *rec_new
+
+        # Frame 2: capture the graph (rec shapes are now fixed)
+        if self._cuda_graph is None:
+            # Run once to populate shapes
+            with torch.no_grad():
+                fgr, pha, *rec_new = self.model(gpu_input, *rec, downsample_ratio)
+
+            # Allocate static buffers
+            self._cuda_graph_input = gpu_input.clone()
+            self._cuda_graph_rec_in = [r.clone() for r in rec_new]
+
+            # Warm-up for graph capture (3 iters recommended by PyTorch)
+            s = torch.cuda.Stream()
+            s.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(s):
+                for _ in range(3):
+                    with torch.no_grad():
+                        _ = self.model(
+                            self._cuda_graph_input,
+                            *self._cuda_graph_rec_in,
+                            downsample_ratio,
+                        )
+            torch.cuda.current_stream().wait_stream(s)
+
+            # Capture
+            self._cuda_graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(self._cuda_graph):
+                with torch.no_grad():
+                    g_fgr, g_pha, *g_rec = self.model(
+                        self._cuda_graph_input,
+                        *self._cuda_graph_rec_in,
+                        downsample_ratio,
+                    )
+
+            self._cuda_graph_output_fgr = g_fgr
+            self._cuda_graph_output_pha = g_pha
+            self._cuda_graph_rec_out = g_rec
+
+            logger.info("CUDA Graph captured for PyTorch inference")
+
+            # Return the initial result (pre-capture run)
+            return fgr, pha, *rec_new
+
+        # Frame 3+: replay the captured graph
+        self._cuda_graph_input.copy_(gpu_input)
+        for i, r in enumerate(rec):
+            if r is not None and self._cuda_graph_rec_in[i] is not None:
+                self._cuda_graph_rec_in[i].copy_(r)
+
+        self._cuda_graph.replay()
+
+        # Copy outputs (graph output tensors are static buffers)
+        fgr = self._cuda_graph_output_fgr.clone()
+        pha = self._cuda_graph_output_pha.clone()
+        rec_new = [r.clone() for r in self._cuda_graph_rec_out]
+
+        # Feed rec_out back to rec_in for next frame
+        for i in range(len(self._cuda_graph_rec_in)):
+            self._cuda_graph_rec_in[i].copy_(self._cuda_graph_rec_out[i])
+
         return fgr, pha, *rec_new
 
     def _refine_alpha(self, pha, src):
@@ -936,7 +1304,15 @@ class MatteProcessor:
                 img = Image.open(frame_path).convert("RGB")
                 src = transform(img).unsqueeze(0).to(self.device)
 
+                # channels_last for tensor core acceleration
+                mc = self.settings.matte
+                if mc.channels_last and self.device.type == "cuda":
+                    src = src.contiguous(memory_format=torch.channels_last)
+
                 fgr, pha, *rec = self.model(src, *rec, downsample_ratio)
+
+                if mc.refine_alpha:
+                    pha = self._refine_alpha(pha, src)
 
                 # Build green-screen composite
                 alpha_np = (pha[0, 0].cpu().numpy() * 255).astype(np.uint8)
@@ -1003,10 +1379,15 @@ class MatteProcessor:
             cx, cy = 0, 0
             proc_w, proc_h = src_w, src_h
 
-        # Skip TRT in GPU-resident path — PyNvVideoCodec's CUDA context
-        # conflicts with TRT's context, causing illegal memory access.
-        # PyTorch FP16 inference is sufficient (20+ fps at 4K).
-        self._trt_engine = None
+        # Prepare inference engine — ORT manages its own CUDA context so it's
+        # safe alongside PyNvVideoCodec. Raw TRT MUST NOT be used here because
+        # TRT's CUDA context conflicts with PyNvVideoCodec (silently returns
+        # fgr=0/pha=1 → black video).
+        self._prepare_inference_engine(proc_h, proc_w)
+        # If ORT didn't engage, disable raw TRT for GPU-resident path
+        if self._ort_engine is None and self._trt_engine is not None:
+            logger.info("Disabling raw TRT in GPU-resident path (CUDA context conflict)")
+            self._trt_engine = None
 
         dtype = torch.float16 if getattr(self, "_use_fp16", False) else torch.float32
 
@@ -1070,8 +1451,10 @@ class MatteProcessor:
 
         try:
             # Start GPU decoder (RGBP = planar RGB → CHW uint8 on GPU)
+            # cuda_context=0 uses the primary CUDA context (shared with PyTorch/TRT)
             decoder = nvc.SimpleDecoder(
                 str(input_path), gpu_id=0,
+                cuda_context=0, cuda_stream=0,
                 output_color_type=nvc.OutputColorType.RGBP,
             )
 
@@ -1091,8 +1474,15 @@ class MatteProcessor:
                 gpu_input[0].copy_(frame_tensor.to(dtype))
                 gpu_input.div_(255.0)
 
-                # GPU inference (TRT or PyTorch)
+                # channels_last for tensor core acceleration
+                if mc.channels_last:
+                    gpu_input = gpu_input.contiguous(memory_format=torch.channels_last)
+
+                # GPU inference (ORT or PyTorch)
                 fgr, pha, *rec = self._infer_frame(gpu_input, rec, mc.downsample_ratio)
+
+                if mc.refine_alpha:
+                    pha = self._refine_alpha(pha, gpu_input)
 
                 # GPU compositing: out = green + pha * (fgr - green)
                 torch.addcmul(
@@ -1156,6 +1546,40 @@ class MatteProcessor:
             if self.device and self.device.type == "cuda":
                 torch.cuda.empty_cache()
 
+    # Files that crashed PyNvVideoCodec (segfault-prone) — skip GPU-resident for these.
+    # Persisted as a simple file so it survives worker restarts.
+    _NVDEC_BLOCKLIST_FILE = Path(__file__).parent.parent / "cache" / "nvdec_blocklist.txt"
+
+    def _is_nvdec_blocked(self, input_path: Path) -> bool:
+        """Check if a file previously caused a PyNvVideoCodec segfault."""
+        try:
+            if self._NVDEC_BLOCKLIST_FILE.exists():
+                blocked = self._NVDEC_BLOCKLIST_FILE.read_text().strip().splitlines()
+                return input_path.name in blocked
+        except OSError:
+            pass
+        return False
+
+    def _mark_nvdec_blocked(self, input_path: Path):
+        """Mark a file as unsafe for PyNvVideoCodec (called before GPU-resident attempt)."""
+        try:
+            self._NVDEC_BLOCKLIST_FILE.parent.mkdir(parents=True, exist_ok=True)
+            with open(self._NVDEC_BLOCKLIST_FILE, "a") as f:
+                f.write(input_path.name + "\n")
+            logger.info("Marked %s in NVDEC blocklist", input_path.name)
+        except OSError as e:
+            logger.warning("Could not write NVDEC blocklist: %s", e)
+
+    def _unmark_nvdec_blocked(self, input_path: Path):
+        """Remove a file from the blocklist after successful GPU-resident processing."""
+        try:
+            if self._NVDEC_BLOCKLIST_FILE.exists():
+                lines = self._NVDEC_BLOCKLIST_FILE.read_text().strip().splitlines()
+                lines = [l for l in lines if l != input_path.name]
+                self._NVDEC_BLOCKLIST_FILE.write_text("\n".join(lines) + "\n" if lines else "")
+        except OSError:
+            pass
+
     def _process_video_with_best_backend(
         self,
         input_path: Path,
@@ -1170,19 +1594,27 @@ class MatteProcessor:
         GPU-resident uses PyNvVideoCodec for zero-copy GPU decode, which is
         10-20x faster than the streaming FFmpeg-pipe path. Falls back to
         streaming if PyNvVideoCodec is unavailable or encounters an error.
+
+        Files that previously caused a PyNvVideoCodec segfault are blocklisted
+        and sent directly to the streaming path.
         """
         torch, _, _ = _import_torch()
 
-        if self._check_pynvvideocodec():
+        if self._is_nvdec_blocked(input_path):
+            logger.warning("File %s is NVDEC-blocklisted, using streaming path", input_path.name)
+        elif self._check_pynvvideocodec():
+            # Mark before attempt — if we segfault, the file is already blocklisted
+            # for the next worker restart. Removed on success.
+            self._mark_nvdec_blocked(input_path)
             try:
                 logger.info("GPU-resident pipeline: %s", input_path.name)
-                # TRT disabled inside _process_video_gpu_resident (CUDA context conflict)
                 success = self._process_video_gpu_resident(
                     input_path, output_path, probe,
                     crop_region=crop_region, bitrate=bitrate,
                     progress_callback=progress_callback,
                 )
                 if success:
+                    self._unmark_nvdec_blocked(input_path)
                     return True
                 logger.warning("GPU-resident returned False, falling back to streaming")
             except Exception as e:
@@ -1425,8 +1857,15 @@ class MatteProcessor:
                     )
                     gpu_input.div_(255.0)
 
-                # --- GPU inference (TRT or PyTorch) ---
+                # channels_last for tensor core acceleration
+                if mc.channels_last:
+                    gpu_input = gpu_input.contiguous(memory_format=torch.channels_last)
+
+                # --- GPU inference (ORT or PyTorch) ---
                 fgr, pha, *rec = self._infer_frame(gpu_input, rec, mc.downsample_ratio)
+
+                if mc.refine_alpha:
+                    pha = self._refine_alpha(pha, gpu_input)
 
                 # --- GPU compositing: out = green + pha * (fgr - green) ---
                 torch.addcmul(green_tensor.expand_as(fgr), pha, fgr - green_tensor, out=out_gpu)
@@ -1626,9 +2065,16 @@ class MatteProcessor:
     ) -> bool:
         """Matte VR SBS video — each eye independently for temporal consistency.
 
-        Dispatches to streaming or legacy path based on settings.matte.use_streaming.
+        Dispatches to alpha_pack (Intel), streaming, or legacy path.
         """
         mc = self.settings.matte
+
+        # Alpha pack path: single-pass pipeline for Intel/VAAPI
+        if mc.output_type == "alpha_pack":
+            return self._process_vr_sbs_alpha_pack(
+                input_path, output_path, progress_callback,
+            )
+
         if mc.use_streaming:
             return self._process_vr_sbs_streaming(
                 input_path, output_path, progress_callback,
@@ -1636,6 +2082,226 @@ class MatteProcessor:
         return self._process_vr_sbs_legacy(
             input_path, output_path, info, progress_callback,
         )
+
+    def _process_vr_sbs_alpha_pack(
+        self,
+        input_path: Path,
+        output_path: Path,
+        progress_callback: ProgressCallback = None,
+    ) -> bool:
+        """Single-pass VR SBS alpha packing pipeline.
+
+        Decodes full SBS frame, runs inference on left eye only,
+        packs alpha into corner dead zones of both eyes, encodes output.
+        Designed for Intel Arc + OpenVINO but works on any platform.
+
+        Flow:
+            FFmpeg decode → crop left eye → OpenVINO inference → AlphaPacker → FFmpeg encode
+        """
+        import queue
+        import threading
+
+        import cv2
+        import numpy as np
+        from src.alpha_packer import AlphaPacker
+
+        mc = self.settings.matte
+        logger.info("Alpha pack VR SBS: %s", input_path.name)
+
+        if progress_callback:
+            progress_callback("probing", 1)
+
+        probe = self._probe_video_pipe_info(input_path)
+        full_w, full_h = probe["width"], probe["height"]
+        eye_w = full_w // 2
+        fps_str = probe["fps_str"]
+        total_frames = probe["total_frames"]
+
+        # Prepare inference engine (OpenVINO on Intel, ORT/PyTorch on NVIDIA)
+        self._prepare_inference_engine(full_h, eye_w)
+
+        # Alpha packer
+        packer = AlphaPacker(scale=mc.alpha_pack_scale)
+
+        # --- FFmpeg decode pipe (full SBS frame, RGB24) ---
+        frame_bytes = full_w * full_h * 3
+        pipe_bufsize = frame_bytes * 4
+
+        decode_cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
+        # Use VAAPI hardware decode on Intel if available
+        if self._platform == "intel" and self._probe_vaapi():
+            decode_cmd.extend([
+                "-hwaccel", "vaapi",
+                "-hwaccel_device", mc.vaapi_device,
+                "-hwaccel_output_format", "vaapi",
+                "-i", str(input_path),
+                "-vf", "hwdownload,format=nv12",
+            ])
+        else:
+            decode_cmd.extend(["-i", str(input_path)])
+        decode_cmd.extend(["-pix_fmt", "rgb24", "-f", "rawvideo", "-v", "error", "pipe:1"])
+
+        # --- FFmpeg encode pipe ---
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        if self._platform == "intel":
+            encode_cmd = self._build_encode_cmd_vaapi(
+                output_path, full_w, full_h, fps_str,
+                audio_source=input_path if probe["has_audio"] else None,
+                has_audio=probe["has_audio"],
+            )
+        else:
+            pipe_input_args = [
+                "-f", "rawvideo", "-pix_fmt", "rgb24",
+                "-s", f"{full_w}x{full_h}", "-r", fps_str,
+                "-i", "pipe:0",
+            ]
+            audio_args = None
+            if probe["has_audio"]:
+                audio_args = ["-i", str(input_path), "-map", "0:v", "-map", "1:a", "-c:a", "copy"]
+            encode_cmd = self._build_encode_cmd(
+                pipe_input_args, output_path, mc.vr_encode_bitrate,
+                extra_input_args=audio_args,
+            )
+
+        # --- Async 3-stage pipeline ---
+        SENTINEL = None
+        decode_q: queue.Queue = queue.Queue(maxsize=4)
+        encode_q: queue.Queue = queue.Queue(maxsize=4)
+        decode_error = [None]
+        encode_error = [None]
+
+        decoder = subprocess.Popen(
+            decode_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            bufsize=pipe_bufsize,
+        )
+        encoder = subprocess.Popen(
+            encode_cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE,
+            bufsize=pipe_bufsize,
+        )
+
+        def decode_thread():
+            try:
+                while True:
+                    raw = decoder.stdout.read(frame_bytes)
+                    if not raw or len(raw) < frame_bytes:
+                        break
+                    decode_q.put(raw)
+            except Exception as e:
+                decode_error[0] = e
+            finally:
+                decode_q.put(SENTINEL)
+
+        def encode_thread():
+            try:
+                while True:
+                    data = encode_q.get()
+                    if data is SENTINEL:
+                        break
+                    encoder.stdin.write(data)
+            except Exception as e:
+                encode_error[0] = e
+
+        rec = [None] * 4
+
+        try:
+            t_decode = threading.Thread(target=decode_thread, daemon=True)
+            t_encode = threading.Thread(target=encode_thread, daemon=True)
+            t_decode.start()
+            t_encode.start()
+
+            if progress_callback:
+                progress_callback("matting", 5)
+
+            frame_idx = 0
+            t_start = time.time()
+
+            while True:
+                raw = decode_q.get()
+                if raw is SENTINEL:
+                    break
+
+                # Reshape to full SBS frame
+                frame = np.frombuffer(raw, dtype=np.uint8).reshape(full_h, full_w, 3).copy()
+
+                # Crop left eye (NumPy slice — zero copy for read)
+                left_eye = frame[:, :eye_w, :]
+
+                # Normalize for inference: HWC uint8 → NCHW float32
+                src = left_eye.astype(np.float32) / 255.0
+                src = np.transpose(src, (2, 0, 1))  # HWC → CHW
+                src = np.expand_dims(src, 0)  # CHW → NCHW
+
+                # Inference (dispatches to OpenVINO/ORT/PyTorch)
+                fgr, pha, *rec = self._infer_frame(src, rec, mc.downsample_ratio)
+
+                # Extract alpha matte [H, W] float32
+                if hasattr(pha, 'cpu'):
+                    # PyTorch tensor path
+                    alpha = pha[0, 0].cpu().numpy()
+                elif isinstance(pha, np.ndarray):
+                    alpha = pha[0, 0] if pha.ndim == 4 else pha
+                else:
+                    alpha = np.array(pha[0, 0])
+
+                # Pack alpha into corner dead zones (modifies frame in-place)
+                packer.pack(frame, alpha, eye_width=eye_w)
+
+                # Write packed frame to encode pipe
+                encode_q.put(frame.tobytes())
+
+                frame_idx += 1
+                if frame_idx % mc.progress_interval == 0:
+                    elapsed = time.time() - t_start
+                    fps_actual = frame_idx / max(elapsed, 0.1)
+                    if progress_callback:
+                        pct = min(frame_idx / max(total_frames, 1) * 100, 99)
+                        progress_callback("matting", pct)
+                    logger.info(
+                        "  Alpha pack: %d/%d frames (%.1f fps)",
+                        frame_idx, total_frames, fps_actual,
+                    )
+
+            # Signal encode thread to finish
+            encode_q.put(SENTINEL)
+            t_encode.join(timeout=30)
+            t_decode.join(timeout=10)
+
+            encoder.stdin.close()
+            encoder.wait()
+            decoder.wait()
+
+            if decode_error[0]:
+                logger.error("Decode thread error: %s", decode_error[0])
+            if encode_error[0]:
+                logger.error("Encode thread error: %s", encode_error[0])
+
+            if encoder.returncode != 0:
+                err = encoder.stderr.read().decode() if encoder.stderr else ""
+                logger.error("Alpha pack encode failed: %s", err[-500:])
+                return False
+
+            elapsed = time.time() - t_start
+            fps_avg = frame_idx / max(elapsed, 0.1)
+            logger.info(
+                "Alpha pack complete: %d frames in %.1fs (%.1f fps avg)",
+                frame_idx, elapsed, fps_avg,
+            )
+
+            if progress_callback:
+                progress_callback("complete", 100)
+            return True
+
+        except Exception as e:
+            logger.error("Alpha pack pipeline error: %s", e)
+            import traceback
+            logger.error(traceback.format_exc())
+            return False
+
+        finally:
+            if decoder and decoder.poll() is None:
+                decoder.kill()
+            if encoder and encoder.poll() is None:
+                encoder.kill()
 
     def _process_vr_sbs_streaming(
         self,
@@ -1675,12 +2341,18 @@ class MatteProcessor:
             if not success:
                 return False
 
-            # Reset recurrent state for right eye (preserves loaded model/TRT engine)
-            if self._trt_engine is not None:
+            # Reset recurrent state for right eye (preserves loaded model/engines)
+            if self._ort_engine is not None:
+                dtype_str = "float16" if getattr(self, "_use_fp16", False) else "float32"
+                self._ort_engine.reset_recurrent_state(dtype_str)
+            elif self._trt_engine is not None:
                 self._trt_engine.reset_recurrent_state()
             else:
                 # PyTorch path: need to reload model to clear recurrent state
                 self.model = None
+            # Reset CUDA graph (rec state shapes may differ between eyes)
+            self._cuda_graph = None
+            self._cuda_graph_frame_count = 0
 
             if progress_callback:
                 progress_callback("matting_right", 50)
@@ -1759,11 +2431,17 @@ class MatteProcessor:
                 downsample_ratio=mc.downsample_ratio,
             )
 
-            # Reset recurrent state for right eye (preserves loaded model/TRT engine)
-            if self._trt_engine is not None:
+            # Reset recurrent state for right eye (preserves loaded model/engines)
+            if self._ort_engine is not None:
+                dtype_str = "float16" if getattr(self, "_use_fp16", False) else "float32"
+                self._ort_engine.reset_recurrent_state(dtype_str)
+            elif self._trt_engine is not None:
                 self._trt_engine.reset_recurrent_state()
             else:
                 self.model = None
+            # Reset CUDA graph (rec state shapes may differ between eyes)
+            self._cuda_graph = None
+            self._cuda_graph_frame_count = 0
 
             if progress_callback:
                 progress_callback("matting_right", 50)
