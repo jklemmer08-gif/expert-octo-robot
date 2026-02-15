@@ -3,6 +3,7 @@
 
 Loads ONNX model, runs inference on a dummy frame,
 verifies output shapes and recurrent state cycling.
+Benchmarks both standard (float32 NCHW) and raw (uint8 NHWC) paths.
 
 Usage:
     python scripts/test_openvino.py [--onnx PATH] [--device GPU|CPU] [--resolution 4000x4000]
@@ -64,15 +65,18 @@ def main():
     if not success:
         sys.exit(1)
 
-    # Run inference on dummy frames
-    print(f"\n--- Running {args.frames} frames ---")
-    times = []
+    print(f"  has_raw_input (PPP model): {engine.has_raw_input}")
+
+    # ---- Benchmark standard path (float32 NCHW) ----
+    print(f"\n--- Standard path: {args.frames} frames (float32 NCHW) ---")
+    engine.reset_recurrent_state()
+    times_std = []
     for i in range(args.frames):
         dummy = np.random.rand(1, 3, h, w).astype(np.float32)
         t0 = time.time()
         fgr, pha = engine.infer(dummy)
         elapsed = time.time() - t0
-        times.append(elapsed)
+        times_std.append(elapsed)
 
         if i == 0:
             print(f"  Frame {i}: fgr={fgr.shape} pha={pha.shape} ({elapsed:.3f}s)")
@@ -81,15 +85,63 @@ def main():
             assert fgr.dtype == np.float32, f"fgr dtype: {fgr.dtype}"
             assert pha.dtype == np.float32, f"pha dtype: {pha.dtype}"
             print("  Shape/dtype checks: PASSED")
-        elif i == args.frames - 1:
-            print(f"  Frame {i}: ({elapsed:.3f}s)")
 
-    # Performance summary
-    avg_ms = np.mean(times[1:]) * 1000  # Skip first frame (warm-up)
+    avg_ms = np.mean(times_std[1:]) * 1000
     fps = 1000.0 / avg_ms if avg_ms > 0 else 0
-    print(f"\n--- Performance ---")
     print(f"  Avg: {avg_ms:.1f}ms/frame ({fps:.1f} fps) [excluding warm-up]")
-    print(f"  Min: {min(times[1:]) * 1000:.1f}ms  Max: {max(times[1:]) * 1000:.1f}ms")
+    print(f"  Min: {min(times_std[1:]) * 1000:.1f}ms  Max: {max(times_std[1:]) * 1000:.1f}ms")
+
+    # ---- Benchmark raw path (uint8 NHWC) ----
+    if engine.has_raw_input:
+        print(f"\n--- Raw path: {args.frames} frames (uint8 NHWC, GPU preprocessing) ---")
+        engine.reset_recurrent_state()
+        times_raw = []
+        for i in range(args.frames):
+            dummy = np.random.randint(0, 255, (1, h, w, 3), dtype=np.uint8)
+            t0 = time.time()
+            fgr, pha = engine.infer_raw(dummy)
+            elapsed = time.time() - t0
+            times_raw.append(elapsed)
+
+            if i == 0:
+                print(f"  Frame {i}: fgr={fgr.shape} pha={pha.shape} ({elapsed:.3f}s)")
+                assert fgr.shape == (1, 3, h, w), f"raw fgr shape mismatch: {fgr.shape}"
+                assert pha.shape == (1, 1, h, w), f"raw pha shape mismatch: {pha.shape}"
+                print("  Shape/dtype checks: PASSED")
+
+        avg_ms_raw = np.mean(times_raw[1:]) * 1000
+        fps_raw = 1000.0 / avg_ms_raw if avg_ms_raw > 0 else 0
+        print(f"  Avg: {avg_ms_raw:.1f}ms/frame ({fps_raw:.1f} fps) [excluding warm-up]")
+        print(f"  Min: {min(times_raw[1:]) * 1000:.1f}ms  Max: {max(times_raw[1:]) * 1000:.1f}ms")
+
+        # Compare
+        speedup = avg_ms / avg_ms_raw if avg_ms_raw > 0 else 0
+        saved = avg_ms - avg_ms_raw
+        print(f"\n--- Comparison ---")
+        print(f"  Standard: {avg_ms:.1f}ms  vs  Raw: {avg_ms_raw:.1f}ms")
+        print(f"  Saved: {saved:.1f}ms/frame ({speedup:.2f}x)")
+    else:
+        print("\n--- Raw path: SKIPPED (PrePostProcessor not available) ---")
+
+    # ---- Benchmark end-to-end simulation (uint8 → infer_raw → tobytes) ----
+    if engine.has_raw_input:
+        print(f"\n--- E2E simulation: {args.frames} frames (uint8→infer_raw→extract_alpha→tobytes) ---")
+        engine.reset_recurrent_state()
+        times_e2e = []
+        for i in range(args.frames):
+            # Simulate: decode gives us HWC uint8 frame
+            frame_hwc = np.random.randint(0, 255, (h, w, 3), dtype=np.uint8)
+            t0 = time.time()
+            # Add batch dim (this is what processor.py does)
+            src_raw = np.ascontiguousarray(frame_hwc[np.newaxis])
+            fgr, pha = engine.infer_raw(src_raw)
+            alpha = pha[0, 0]  # extract [H, W]
+            elapsed = time.time() - t0
+            times_e2e.append(elapsed)
+
+        avg_e2e = np.mean(times_e2e[1:]) * 1000
+        fps_e2e = 1000.0 / avg_e2e if avg_e2e > 0 else 0
+        print(f"  Avg: {avg_e2e:.1f}ms/frame ({fps_e2e:.1f} fps)")
 
     # Test recurrent state reset
     print("\n--- Testing recurrent state reset ---")
