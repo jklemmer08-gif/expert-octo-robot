@@ -2050,7 +2050,7 @@ class MatteProcessor:
             logger.error("OpenVINO engine not available for Intel 2D matting")
             return False
 
-        green = np.array(mc.green_color, dtype=np.float32) / 255.0  # [3] normalized
+        # Green color removed — composite now uses uint8 integer math
 
         # --- Decode pipe ---
         frame_bytes = src_w * src_h * 3
@@ -2157,24 +2157,26 @@ class MatteProcessor:
                 if mc.refine_alpha:
                     pha = self._refine_alpha_numpy(pha, mc.alpha_sharpness)
 
-                # Upscale alpha to full resolution, composite with original source
-                # This preserves full 4K detail on the person — only the matte
-                # boundary is at the lower inference resolution.
+                # Upscale alpha to full resolution as uint8 for fast compositing
+                pha_u8 = np.clip(pha * 255.0, 0.0, 255.0).astype(np.uint8)
                 if (infer_w, infer_h) != (src_w, src_h):
-                    pha_full = cv2.resize(pha, (src_w, src_h), interpolation=cv2.INTER_LINEAR)
-                else:
-                    pha_full = pha
+                    pha_u8 = cv2.resize(pha_u8, (src_w, src_h), interpolation=cv2.INTER_LINEAR)
 
-                # Optional despill on original source at full resolution
-                src_f32 = frame.astype(np.float32) / 255.0
+                # Optional despill on original source at full resolution (uint8 path)
                 if mc.despill:
-                    src_f32 = self._despill_numpy(src_f32, pha_full, mc.green_color, mc.despill_strength)
+                    frame = self._despill_numpy_u8(frame, pha_u8, mc.despill_strength)
 
-                # Green screen composite at full resolution
-                # out = green * (1 - pha) + src * pha
-                pha_3 = pha_full[:, :, np.newaxis]  # [H, W, 1]
-                composite = green * (1.0 - pha_3) + src_f32 * pha_3
-                frame_out = np.clip(composite * 255.0, 0.0, 255.0).astype(np.uint8)
+                # Green screen composite at full resolution using uint16 integer math.
+                # out = (green * (255-a) + src * a + 128) / 255
+                # Avoids expensive float32 conversion of 4K frame.
+                alpha_3 = np.stack([pha_u8, pha_u8, pha_u8], axis=2)  # [H, W, 3] uint8
+                inv_alpha = 255 - alpha_3
+                green_u8 = np.array(mc.green_color, dtype=np.uint8)
+                frame_out = (
+                    (green_u8.astype(np.uint16) * inv_alpha
+                     + frame.astype(np.uint16) * alpha_3
+                     + 128) // 255
+                ).astype(np.uint8)
 
                 encode_q.put(frame_out)
 
@@ -2256,6 +2258,44 @@ class MatteProcessor:
         blend = edge_mask * strength
         fgr[:, :, 1] = g * (1.0 - blend) + g_clamped * blend
         return fgr
+
+    @staticmethod
+    def _despill_numpy_u8(
+        frame: "np.ndarray",
+        pha_u8: "np.ndarray",
+        strength: float = 0.8,
+    ) -> "np.ndarray":
+        """Remove green spill from edges using uint8 data. Modifies frame in-place.
+
+        Args:
+            frame: [H, W, 3] uint8 source frame
+            pha_u8: [H, W] uint8 alpha (0-255)
+            strength: despill intensity (0-1)
+
+        Returns:
+            frame with green channel clamped at edge transitions.
+        """
+        import cv2
+        import numpy as np
+
+        # Edge mask: transition zone (roughly 5-250 in uint8 = 0.02-0.98)
+        edge_mask = ((pha_u8 > 5) & (pha_u8 < 250)).astype(np.uint8)
+        kernel = np.ones((5, 5), dtype=np.uint8)
+        edge_mask = cv2.dilate(edge_mask, kernel, iterations=1)
+
+        # Only process pixels in the edge mask for speed
+        mask_idx = edge_mask > 0
+        if not np.any(mask_idx):
+            return frame
+
+        r = frame[:, :, 0][mask_idx].astype(np.int16)
+        g = frame[:, :, 1][mask_idx].astype(np.int16)
+        b = frame[:, :, 2][mask_idx].astype(np.int16)
+        g_clamped = np.minimum(g, np.maximum(r, b))
+        # Blend with integer math: g_new = g + (g_clamped - g) * strength
+        g_new = g + ((g_clamped - g) * int(strength * 256) >> 8)
+        frame[:, :, 1][mask_idx] = np.clip(g_new, 0, 255).astype(np.uint8)
+        return frame
 
     @staticmethod
     def _refine_alpha_numpy(pha: "np.ndarray", sharpness: str = "fine") -> "np.ndarray":
