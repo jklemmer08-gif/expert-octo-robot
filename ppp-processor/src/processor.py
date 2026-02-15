@@ -2031,9 +2031,11 @@ class MatteProcessor:
         fps_str = probe["fps_str"]
         total_frames = probe["total_frames"]
 
-        # Optional output downscale: reduces pipe data, composite, and encode work.
-        # output_scale=0.75 on 4K → 2880x1620, ~2x faster with ~5% quality loss.
-        out_scale = mc.output_scale
+        # Smart output downscale: scale down only when source exceeds the display's
+        # perceptual limit (min_output_height, default 1080 for Quest 3S).
+        # Never upscale, never go below min_output_height.
+        min_h = mc.min_output_height
+        out_scale = min(1.0, max(mc.output_scale, min_h / orig_h)) if orig_h > min_h else 1.0
         if out_scale < 1.0:
             src_w = int(orig_w * out_scale)
             src_h = int(orig_h * out_scale)
@@ -2052,7 +2054,7 @@ class MatteProcessor:
         logger.info(
             "Intel 2D: %dx%d%s → infer at %dx%d (%.0f%%), despill=%s, refine=%s",
             src_w, src_h,
-            f" (scaled from {orig_w}x{orig_h})" if out_scale < 1.0 else "",
+            f" (scale={out_scale:.2f} from {orig_w}x{orig_h})" if out_scale < 1.0 else "",
             infer_w, infer_h, mc.downsample_ratio * 100,
             mc.despill, mc.refine_alpha,
         )
