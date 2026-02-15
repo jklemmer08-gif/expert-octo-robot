@@ -1960,10 +1960,15 @@ class MatteProcessor:
     ) -> bool:
         """Full matting pipeline for a 2D video.
 
-        Dispatches to streaming (FFmpeg pipes) or legacy (disk-based) path
-        based on settings.matte.use_streaming.
+        Dispatches to Intel (OpenVINO + NumPy), streaming (FFmpeg pipes),
+        or legacy (disk-based) path.
         """
         mc = self.settings.matte
+        # Intel path: OpenVINO + NumPy green screen with despill/refine
+        if self._platform == "intel":
+            return self._process_video_intel(
+                input_path, output_path, progress_callback,
+            )
         if mc.use_streaming:
             return self._process_video_streaming_2d(
                 input_path, output_path, progress_callback,
@@ -1995,6 +2000,335 @@ class MatteProcessor:
         if progress_callback:
             progress_callback("complete" if success else "failed", 100 if success else 0)
         return success
+
+    def _process_video_intel(
+        self,
+        input_path: Path,
+        output_path: Path,
+        progress_callback: ProgressCallback = None,
+    ) -> bool:
+        """2D green screen matting on Intel (OpenVINO + NumPy).
+
+        Single-pass pipeline: decode → infer → despill → refine → composite → encode.
+        No PyTorch required — uses OpenVINO for inference and NumPy/OpenCV
+        for post-processing.
+        """
+        import os
+        import queue
+        import threading
+
+        import cv2
+        import numpy as np
+
+        mc = self.settings.matte
+        logger.info("Matting video (Intel): %s", input_path.name)
+
+        if progress_callback:
+            progress_callback("probing", 1)
+
+        probe = self._probe_video_pipe_info(input_path)
+        src_w, src_h = probe["width"], probe["height"]
+        fps_str = probe["fps_str"]
+        total_frames = probe["total_frames"]
+
+        # Inference at downsample_ratio scale, composite at full resolution
+        infer_h = int(src_h * mc.downsample_ratio)
+        infer_w = int(src_w * mc.downsample_ratio)
+        # Ensure even dimensions
+        infer_h += infer_h % 2
+        infer_w += infer_w % 2
+
+        logger.info(
+            "Intel 2D: %dx%d → infer at %dx%d (%.0f%%), despill=%s, refine=%s",
+            src_w, src_h, infer_w, infer_h, mc.downsample_ratio * 100,
+            mc.despill, mc.refine_alpha,
+        )
+
+        # Prepare OpenVINO engine at inference resolution
+        self._prepare_inference_engine(infer_h, infer_w)
+        if self._openvino_engine is None:
+            logger.error("OpenVINO engine not available for Intel 2D matting")
+            return False
+
+        green = np.array(mc.green_color, dtype=np.float32) / 255.0  # [3] normalized
+
+        # --- Decode pipe ---
+        frame_bytes = src_w * src_h * 3
+        pipe_bufsize = frame_bytes * 4
+
+        decode_cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-threads", "0",
+            "-i", str(input_path),
+            "-pix_fmt", "rgb24", "-f", "rawvideo", "-v", "error", "pipe:1",
+        ]
+
+        # --- Encode pipe ---
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        encode_cmd = self._build_encode_cmd_vaapi(
+            output_path, src_w, src_h, fps_str,
+            audio_source=input_path if probe["has_audio"] else None,
+            has_audio=probe["has_audio"],
+        )
+
+        # --- Async pipeline ---
+        SENTINEL = None
+        decode_q: queue.Queue = queue.Queue(maxsize=4)
+        encode_q: queue.Queue = queue.Queue(maxsize=4)
+        decode_error = [None]
+        encode_error = [None]
+
+        decoder = subprocess.Popen(
+            decode_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            bufsize=pipe_bufsize,
+        )
+        encoder = subprocess.Popen(
+            encode_cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE,
+            bufsize=pipe_bufsize,
+        )
+
+        def decode_thread():
+            try:
+                buf = bytearray(frame_bytes)
+                mv = memoryview(buf)
+                while True:
+                    offset = 0
+                    while offset < frame_bytes:
+                        n = decoder.stdout.readinto(mv[offset:])
+                        if n == 0 or n is None:
+                            break
+                        offset += n
+                    if offset < frame_bytes:
+                        break
+                    frame = np.frombuffer(buf, dtype=np.uint8).reshape(src_h, src_w, 3).copy()
+                    decode_q.put(frame)
+            except Exception as e:
+                decode_error[0] = e
+            finally:
+                decode_q.put(SENTINEL)
+
+        def encode_thread():
+            try:
+                fd = encoder.stdin.fileno()
+                while True:
+                    data = encode_q.get()
+                    if data is SENTINEL:
+                        break
+                    if isinstance(data, np.ndarray):
+                        mv = memoryview(data)
+                        total = mv.nbytes
+                        written = 0
+                        while written < total:
+                            written += os.write(fd, mv[written:])
+                    else:
+                        encoder.stdin.write(data)
+            except Exception as e:
+                encode_error[0] = e
+
+        try:
+            t_decode = threading.Thread(target=decode_thread, daemon=True)
+            t_encode = threading.Thread(target=encode_thread, daemon=True)
+            t_decode.start()
+            t_encode.start()
+
+            if progress_callback:
+                progress_callback("matting", 5)
+
+            frame_idx = 0
+            t_start = time.time()
+
+            while True:
+                frame = decode_q.get()
+                if frame is SENTINEL:
+                    break
+
+                # Downscale for inference
+                frame_small = cv2.resize(
+                    frame, (infer_w, infer_h), interpolation=cv2.INTER_AREA,
+                )
+                src_raw = np.ascontiguousarray(frame_small[np.newaxis])  # [1, H, W, 3] uint8
+
+                # OpenVINO inference → fgr + pha
+                fgr_raw, pha_raw = self._openvino_engine.infer_raw(src_raw)
+                # fgr_raw: [1, 3, infer_H, infer_W] float32
+                # pha_raw: [1, 1, infer_H, infer_W] float32
+
+                # Convert to HWC for post-processing
+                fgr = np.transpose(fgr_raw[0], (1, 2, 0))  # [H, W, 3]
+                pha = pha_raw[0, 0]  # [H, W]
+
+                # Optional despill (green spill removal at edges)
+                if mc.despill:
+                    fgr = self._despill_numpy(fgr, pha, mc.green_color, mc.despill_strength)
+
+                # Optional alpha refinement
+                if mc.refine_alpha:
+                    pha = self._refine_alpha_numpy(pha, mc.alpha_sharpness)
+
+                # Green screen composite at inference resolution
+                # out = green * (1 - pha) + fgr * pha
+                pha_3 = pha[:, :, np.newaxis]  # [H, W, 1]
+                composite = green * (1.0 - pha_3) + fgr * pha_3
+                composite = np.clip(composite, 0.0, 1.0)
+
+                # Upscale composite to full resolution
+                composite_u8 = (composite * 255.0).astype(np.uint8)
+                if (infer_w, infer_h) != (src_w, src_h):
+                    frame_out = cv2.resize(
+                        composite_u8, (src_w, src_h), interpolation=cv2.INTER_LANCZOS4,
+                    )
+                else:
+                    frame_out = composite_u8
+
+                encode_q.put(frame_out)
+
+                frame_idx += 1
+                if frame_idx % mc.progress_interval == 0:
+                    elapsed = time.time() - t_start
+                    fps_actual = frame_idx / max(elapsed, 0.1)
+                    pct = min(frame_idx / max(total_frames, 1) * 100, 99)
+                    logger.info(
+                        "  Intel 2D: %d/%d frames (%.1f fps)",
+                        frame_idx, total_frames, fps_actual,
+                    )
+                    if progress_callback:
+                        progress_callback("matting", int(5 + pct * 0.9))
+
+            # Signal encode done
+            encode_q.put(SENTINEL)
+            t_encode.join(timeout=30)
+            t_decode.join(timeout=10)
+
+            encoder.stdin.close()
+            encoder.wait()
+            decoder.wait()
+
+            if decode_error[0]:
+                logger.error("Decode thread error: %s", decode_error[0])
+            if encode_error[0]:
+                logger.error("Encode thread error: %s", encode_error[0])
+
+            elapsed = time.time() - t_start
+            fps_actual = frame_idx / max(elapsed, 0.1)
+            logger.info(
+                "Intel 2D matting complete: %d frames in %.1fs (%.1f fps)",
+                frame_idx, elapsed, fps_actual,
+            )
+
+            if progress_callback:
+                progress_callback("complete", 100)
+
+            return encoder.returncode == 0
+
+        finally:
+            if decoder and decoder.poll() is None:
+                decoder.kill()
+            if encoder and encoder.poll() is None:
+                encoder.kill()
+
+    @staticmethod
+    def _despill_numpy(
+        fgr: "np.ndarray",
+        pha: "np.ndarray",
+        green_color: list,
+        strength: float = 0.8,
+    ) -> "np.ndarray":
+        """Remove green spill from foreground edges using NumPy.
+
+        Args:
+            fgr: [H, W, 3] float32 foreground (0-1)
+            pha: [H, W] float32 alpha (0-1)
+            green_color: [R, G, B] int 0-255
+            strength: despill intensity (0-1)
+
+        Returns:
+            Cleaned fgr with green spill suppressed at edges.
+        """
+        import cv2
+        import numpy as np
+
+        # Edge mask: transition zone pixels where chroma key struggles
+        edge_mask = ((pha > 0.02) & (pha < 0.98)).astype(np.float32)
+        # Dilate to catch adjacent spill
+        kernel = np.ones((5, 5), dtype=np.uint8)
+        edge_mask = cv2.dilate(edge_mask, kernel, iterations=1)
+
+        r, g, b = fgr[:, :, 0], fgr[:, :, 1], fgr[:, :, 2]
+        # Classic despill: clamp green to max(red, blue)
+        g_clamped = np.minimum(g, np.maximum(r, b))
+        # Blend: only affect edge regions
+        blend = edge_mask * strength
+        fgr[:, :, 1] = g * (1.0 - blend) + g_clamped * blend
+        return fgr
+
+    @staticmethod
+    def _refine_alpha_numpy(pha: "np.ndarray", sharpness: str = "fine") -> "np.ndarray":
+        """Refine alpha matte using OpenCV box-filter guided filter.
+
+        Args:
+            pha: [H, W] float32 alpha (0-1)
+            sharpness: "fine" for multi-scale + sharpening, "soft" for legacy
+
+        Returns:
+            Refined alpha [H, W] float32.
+        """
+        import cv2
+        import numpy as np
+
+        def _guided_filter_gray(p, radius, eps=1e-4):
+            """Self-guided filter: smooths alpha while preserving edges."""
+            k = 2 * radius + 1
+            mean_p = cv2.blur(p, (k, k))
+            mean_pp = cv2.blur(p * p, (k, k))
+            var_p = mean_pp - mean_p * mean_p
+            a = var_p / (var_p + eps)
+            b = mean_p - a * mean_p
+            mean_a = cv2.blur(a, (k, k))
+            mean_b = cv2.blur(b, (k, k))
+            return mean_a * p + mean_b
+
+        if sharpness == "soft":
+            # Single-scale guided filter
+            pha = _guided_filter_gray(pha, radius=8)
+            pha = np.clip(pha, 0.0, 1.0)
+            pha[pha < 0.05] = 0.0
+            pha[pha > 0.95] = 1.0
+            # Morphological close (3px)
+            kernel = np.ones((3, 3), dtype=np.uint8)
+            pha_u8 = (pha * 255).astype(np.uint8)
+            pha_u8 = cv2.morphologyEx(pha_u8, cv2.MORPH_CLOSE, kernel)
+            pha = pha_u8.astype(np.float32) / 255.0
+        else:
+            # "fine": multi-scale guided filter + sharpening
+            pha_fine = _guided_filter_gray(pha, radius=4)
+            pha_bulk = _guided_filter_gray(pha, radius=12)
+
+            # Blend by local variance — high variance uses fine filter
+            local_mean = cv2.blur(pha, (9, 9))
+            local_var = cv2.blur((pha - local_mean) ** 2, (9, 9))
+            blend_w = np.clip(local_var * 50.0, 0.0, 1.0)
+            pha = pha_bulk * (1.0 - blend_w) + pha_fine * blend_w
+
+            # Tighter thresholds
+            pha = np.clip(pha, 0.0, 1.0)
+            lo, hi = 0.02, 0.98
+            mask_lo = (pha < lo).astype(np.float32)
+            mask_hi = (pha > hi).astype(np.float32)
+            mask_mid = 1.0 - mask_lo - mask_hi
+            pha_mid = np.clip((pha - lo) / (hi - lo), 0.0, 1.0)
+            pha = mask_hi + mask_mid * pha_mid
+
+            # Laplacian edge sharpening
+            laplacian = cv2.Laplacian(pha, cv2.CV_32F, ksize=3)
+            pha = np.clip(pha + 0.15 * laplacian, 0.0, 1.0)
+
+            # Morphological close (2px — preserve fine hair)
+            kernel = np.ones((3, 3), dtype=np.uint8)
+            pha_u8 = (pha * 255).astype(np.uint8)
+            pha_u8 = cv2.morphologyEx(pha_u8, cv2.MORPH_CLOSE, kernel)
+            pha = pha_u8.astype(np.float32) / 255.0
+
+        return pha
 
     def _process_video_legacy(
         self,

@@ -26,7 +26,10 @@ matte:
   downsample_ratio: 0.4
   green_color: [0, 177, 64]
   output_type: "alpha_pack"
-  refine_alpha: false
+  refine_alpha: true
+  despill: true
+  despill_strength: 0.8
+  alpha_sharpness: "fine"
   channels_last: false
   cuda_graphs_pytorch: false
   openvino_device: "GPU"
