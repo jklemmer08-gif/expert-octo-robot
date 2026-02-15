@@ -12,6 +12,7 @@ Requires: openvino>=2024.6.0, numpy
 from __future__ import annotations
 
 import logging
+import math
 import time
 from pathlib import Path
 from typing import Optional, Tuple
@@ -42,11 +43,18 @@ class RVMOpenVINOEngine:
     optimization internally when targeting GPU.
     """
 
+    # RVM resnet50 recurrent state metadata:
+    # channels per decoder stage, and stride divisors from original resolution
+    REC_CHANNELS = [16, 32, 64, 128]    # r1, r2, r3, r4
+    REC_STRIDES = [8, 16, 32, 64]       # spatial dims = ceil(H/stride), ceil(W/stride)
+
     def __init__(self):
         self._compiled_model = None
         self._infer_request = None
         self._rec_states = [None] * 4  # NumPy arrays
-        self._rec_shapes = None  # Discovered after first inference
+        self._rec_shapes = None  # Computed from input resolution
+        self._input_height = 0
+        self._input_width = 0
         self._device = "GPU"
         self._model_path: Optional[Path] = None
 
@@ -106,11 +114,21 @@ class RVMOpenVINOEngine:
             # Create persistent infer request for reuse
             self._infer_request = self._compiled_model.create_infer_request()
 
-            # Initialize recurrent states as minimal zeros (first frame)
+            # Compute correct recurrent state shapes from input resolution.
+            # RVM's decoder stages produce rec states at specific spatial scales
+            # relative to the original input (not the internally-downsampled input).
+            self._input_height = height
+            self._input_width = width
+            self._rec_shapes = self._compute_rec_shapes(height, width)
+            logger.info(
+                "Rec shapes for %dx%d: %s",
+                width, height, [list(s) for s in self._rec_shapes],
+            )
+
+            # Initialize with correct shapes
             self._rec_states = [
-                np.zeros((1, 1, 1, 1), dtype=np.float32) for _ in range(4)
+                np.zeros(s, dtype=np.float32) for s in self._rec_shapes
             ]
-            self._rec_shapes = None
 
             # Warm-up inference to trigger JIT compilation
             logger.info("Running warm-up inference at %dx%d...", width, height)
@@ -131,6 +149,18 @@ class RVMOpenVINOEngine:
             import traceback
             logger.debug(traceback.format_exc())
             return False
+
+    @classmethod
+    def _compute_rec_shapes(cls, height: int, width: int) -> list:
+        """Compute recurrent state shapes from input resolution.
+
+        RVM's decoder stages produce states at spatial scales relative to the
+        original input: r1=/8, r2=/16, r3=/32, r4=/64 with ceil rounding.
+        """
+        return [
+            (1, ch, math.ceil(height / stride), math.ceil(width / stride))
+            for ch, stride in zip(cls.REC_CHANNELS, cls.REC_STRIDES)
+        ]
 
     def _run_inference(self, src: np.ndarray) -> Tuple[np.ndarray, ...]:
         """Run a single inference pass, returning all 6 outputs."""
@@ -187,9 +217,18 @@ class RVMOpenVINOEngine:
                 np.zeros(s, dtype=np.float32) for s in self._rec_shapes
             ]
         else:
-            self._rec_states = [
-                np.zeros((1, 1, 1, 1), dtype=np.float32) for _ in range(4)
-            ]
+            # Fallback: compute from stored dimensions
+            if self._input_height > 0 and self._input_width > 0:
+                self._rec_shapes = self._compute_rec_shapes(
+                    self._input_height, self._input_width,
+                )
+                self._rec_states = [
+                    np.zeros(s, dtype=np.float32) for s in self._rec_shapes
+                ]
+            else:
+                self._rec_states = [
+                    np.zeros((1, 1, 1, 1), dtype=np.float32) for _ in range(4)
+                ]
         logger.debug("Recurrent state reset")
 
     def cleanup(self):
