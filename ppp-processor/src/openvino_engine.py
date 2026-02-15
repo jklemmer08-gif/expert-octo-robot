@@ -73,12 +73,12 @@ class RVMOpenVINOEngine:
         onnx_path: Path,
         device: str = "GPU",
     ) -> bool:
-        """Load ONNX model and compile for target device.
+        """Load model (ONNX or OpenVINO IR) and compile for target device.
 
         Args:
             height: Input frame height
             width: Input frame width
-            onnx_path: Path to rvm_resnet50.onnx (FP32, opset 17)
+            onnx_path: Path to model (.onnx or .xml OpenVINO IR format)
             device: OpenVINO device string ("GPU", "CPU", etc.)
 
         Returns:
@@ -88,11 +88,19 @@ class RVMOpenVINOEngine:
             ov = _import_ov()
             self._device = device
 
-            if not onnx_path.exists():
-                logger.error("ONNX model not found: %s", onnx_path)
+            # Auto-detect FP16 IR model alongside ONNX
+            model_path = onnx_path
+            if onnx_path.suffix == ".onnx":
+                fp16_ir = onnx_path.with_name(onnx_path.stem + "_fp16_ov.xml")
+                if fp16_ir.exists():
+                    logger.info("Found FP16 IR model, using: %s", fp16_ir)
+                    model_path = fp16_ir
+
+            if not model_path.exists():
+                logger.error("Model not found: %s", model_path)
                 return False
 
-            logger.info("Loading ONNX model: %s", onnx_path)
+            logger.info("Loading model: %s", model_path)
             core = ov.Core()
 
             # Check device availability
@@ -107,7 +115,7 @@ class RVMOpenVINOEngine:
 
             # Read model
             start = time.time()
-            model = core.read_model(str(onnx_path))
+            model = core.read_model(str(model_path))
             logger.info("Model read in %.2fs, compiling for %s...", time.time() - start, self._device)
 
             # Performance config
@@ -123,7 +131,7 @@ class RVMOpenVINOEngine:
 
             # --- PrePostProcessor model (uint8 NHWC input, normalize on GPU) ---
             try:
-                self._build_ppp_model(core, onnx_path, config)
+                self._build_ppp_model(core, model_path, config)
             except Exception as e:
                 logger.warning("PrePostProcessor model failed, raw input disabled: %s", e)
                 self._has_ppp = False
@@ -158,7 +166,7 @@ class RVMOpenVINOEngine:
                 logger.info("PPP warm-up: %.2fs", time.time() - start)
                 self.reset_recurrent_state()
 
-            self._model_path = onnx_path
+            self._model_path = model_path
             logger.info(
                 "OpenVINO engine ready for %dx%d on %s (raw_input=%s)",
                 width, height, self._device, self._has_ppp,
