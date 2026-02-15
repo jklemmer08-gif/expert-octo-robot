@@ -47,6 +47,7 @@ class AlphaPacker:
         frame: np.ndarray,
         alpha: np.ndarray,
         eye_width: Optional[int] = None,
+        presized: bool = False,
     ) -> np.ndarray:
         """Pack alpha matte into the corner dead zones of an SBS frame.
 
@@ -56,6 +57,8 @@ class AlphaPacker:
             frame: Full SBS frame [H, W, 3] uint8 (W = 2 * eye_width)
             alpha: Single-eye alpha matte [eye_H, eye_W] float32 (0.0-1.0)
             eye_width: Width of a single eye. Defaults to frame.shape[1] // 2.
+            presized: If True, alpha is already at the target pack scale and
+                      only needs to be converted to uint8 (skip cv2.resize).
 
         Returns:
             The modified frame (same object, modified in-place).
@@ -64,10 +67,14 @@ class AlphaPacker:
         if eye_width is None:
             eye_width = full_w // 2
 
-        # Downscale matte to target size
-        scaled_h = int(h * self.scale)
-        scaled_w = int(eye_width * self.scale)
-        scaled_alpha = cv2.resize(alpha, (scaled_w, scaled_h), interpolation=cv2.INTER_AREA)
+        if presized:
+            scaled_alpha = alpha
+            scaled_h, scaled_w = alpha.shape[:2]
+        else:
+            # Downscale matte to target size
+            scaled_h = int(h * self.scale)
+            scaled_w = int(eye_width * self.scale)
+            scaled_alpha = cv2.resize(alpha, (scaled_w, scaled_h), interpolation=cv2.INTER_AREA)
 
         # Convert to uint8 for red channel painting
         alpha_u8 = (np.clip(scaled_alpha, 0.0, 1.0) * 255.0).astype(np.uint8)
