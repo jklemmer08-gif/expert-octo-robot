@@ -2,7 +2,7 @@
 # No PyTorch, no ONNX Runtime — OpenVINO + infrastructure only
 
 # Inference
-openvino==2024.6.0
+openvino>=2024.6.0
 
 # Image/video processing
 opencv-python-headless>=4.8.0
