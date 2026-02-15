@@ -3,7 +3,7 @@ paths:
   stash_api_key: ""
   library_root: "/home/jtk1234/media-drive1"
   output_dir: "/home/jtk1234/media-drive2/ppp-output"
-  temp_dir: "/mnt/staging/ppp/temp"
+  temp_dir: "/home/jtk1234/ppp-processor/ppp-processor/temp"
   models_dir: "./bin/models"
   realesrgan_bin: "./bin/realesrgan-ncnn-vulkan"
   analysis_dir: "./ppp_analysis"
