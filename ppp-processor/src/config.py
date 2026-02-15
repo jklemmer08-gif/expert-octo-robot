@@ -90,6 +90,23 @@ class JellyfinConfig(BaseSettings):
     })
 
 
+class S3Config(BaseSettings):
+    """S3 storage for cloud worker file staging."""
+    access_key_id: str = ""
+    secret_access_key: str = ""
+    bucket: str = "ppp-processor-media"
+    region: str = "us-east-2"
+
+
+class CloudConfig(BaseSettings):
+    """Cloud GPU processing settings."""
+    primary_provider: str = "runpod"  # "runpod" or "vastai"
+    docker_image: str = "ppp-processor/cloud-worker:latest"
+    setup_timeout: int = 600  # seconds to wait for pod ready
+    processing_timeout: int = 14400  # 4 hours max per job
+    budget_total: float = 50.00
+
+
 class RunPodConfig(BaseSettings):
     api_key: str = ""
     template_id: str = ""
@@ -133,6 +150,9 @@ class MatteConfig(BaseSettings):
     vr_encode_bitrate: str = "50M"   # VR matting output bitrate
     progress_interval: int = 100     # Report progress every N frames
     refine_alpha: bool = False       # Edge refinement via guided filter + morph close
+    despill: bool = False            # Green spill removal on foreground edges
+    despill_strength: float = 0.8    # Despill intensity (0.0-1.0)
+    alpha_sharpness: str = "fine"    # Refine mode: "fine" (multi-scale) or "soft" (legacy)
     channels_last: bool = True       # NHWC memory format for tensor core acceleration
     cuda_graphs_pytorch: bool = True # CUDA Graphs for PyTorch fallback (Windows)
     # Intel/OpenVINO settings
@@ -170,6 +190,8 @@ class Settings(BaseSettings):
     stash: StashConfig = Field(default_factory=StashConfig)
     jellyfin: JellyfinConfig = Field(default_factory=JellyfinConfig)
     runpod: RunPodConfig = Field(default_factory=RunPodConfig)
+    s3: S3Config = Field(default_factory=S3Config)
+    cloud: CloudConfig = Field(default_factory=CloudConfig)
     redis: RedisConfig = Field(default_factory=RedisConfig)
     watcher: WatcherConfig = Field(default_factory=WatcherConfig)
     qa: QAConfig = Field(default_factory=QAConfig)
