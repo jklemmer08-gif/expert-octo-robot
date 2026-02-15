@@ -658,7 +658,8 @@ class MatteProcessor:
             cmd.extend([
                 "-vf", "format=nv12,hwupload",
                 "-c:v", "hevc_vaapi",
-                "-qp", str(ec.vaapi_qp),
+                "-rc_mode", "CQP",
+                "-global_quality", str(ec.vaapi_qp),
                 "-profile:v", "main",
                 "-tag:v", "hvc1",
             ])
