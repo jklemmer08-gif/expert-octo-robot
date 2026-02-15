@@ -95,6 +95,35 @@ class StashClient:
         """, {"input": {"id": scene_id, "tag_ids": current_ids}})
         return True
 
+    def find_scenes_by_tag(self, tag_name: str) -> List[Dict]:
+        """Find all scenes that have a specific tag."""
+        tag_id = self.get_or_create_tag(tag_name)
+        if not tag_id:
+            return []
+        result = self._query("""
+            query($tag_id: [ID!]!) {
+                findScenes(scene_filter: {tags: {value: $tag_id, modifier: INCLUDES}},
+                           filter: {per_page: 100}) {
+                    scenes { id title tags { id name } files { path } }
+                }
+            }
+        """, {"tag_id": [tag_id]})
+        return result.get("findScenes", {}).get("scenes", [])
+
+    def remove_tag_from_scene(self, scene_id: str, tag_name: str) -> bool:
+        """Remove a specific tag from a scene."""
+        scene = self.find_scene_by_id(scene_id)
+        if not scene:
+            return False
+        tag_id = self.get_or_create_tag(tag_name)
+        current_ids = [t["id"] for t in scene.get("tags", []) if t["id"] != tag_id]
+        self._query("""
+            mutation($input: SceneUpdateInput!) {
+                sceneUpdate(input: $input) { id }
+            }
+        """, {"input": {"id": scene_id, "tag_ids": current_ids}})
+        return True
+
     def update_scene_after_upscale(self, scene_id: str, new_path: Path,
                                     resolution: str = ""):
         self.add_tag_to_scene(scene_id, "Upscaled")

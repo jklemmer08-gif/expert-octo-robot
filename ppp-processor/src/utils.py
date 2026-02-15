@@ -50,13 +50,20 @@ def remap_path(path: str) -> str:
 
 
 def platform_path(path: str) -> str:
-    """Remap Linux paths to Windows drive letters when running on Windows."""
+    """Remap Linux paths to Windows drive letters when running on Windows.
+
+    Chains Docker container remapping first, then applies Windows drive mapping.
+    E.g. /media/library/foo → /home/jtk1234/media-drive1/foo → M:\\foo
+    """
     if platform.system() != "Windows":
         return path
+    # First, remap Docker container paths to host paths
+    remapped = remap_path(path)
+    # Then map host Linux paths to Windows drive letters
     for linux_prefix, win_prefix in WINDOWS_PATH_REMAPS:
-        if path.startswith(linux_prefix):
-            remapped = win_prefix + path[len(linux_prefix):]
-            return remapped.replace("/", "\\")
+        if remapped.startswith(linux_prefix):
+            result = win_prefix + remapped[len(linux_prefix):]
+            return result.replace("/", "\\")
     return path
 
 

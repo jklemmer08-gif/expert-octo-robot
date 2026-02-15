@@ -101,6 +101,9 @@ class JobDatabase:
                 gpu_name TEXT,
                 cost REAL,
                 duration_hours REAL,
+                provider TEXT,
+                instance_id TEXT,
+                hourly_rate REAL,
                 timestamp TEXT,
                 FOREIGN KEY (job_id) REFERENCES jobs(id)
             );
@@ -120,6 +123,30 @@ class JobDatabase:
         except sqlite3.OperationalError:
             self.conn.execute("ALTER TABLE jobs ADD COLUMN matte INTEGER DEFAULT 0")
             self.conn.commit()
+
+        # Cloud pipeline columns on jobs
+        for col, default in [
+            ("provider", "NULL"),
+            ("s3_input_key", "NULL"),
+            ("s3_output_key", "NULL"),
+        ]:
+            try:
+                self.conn.execute(f"SELECT {col} FROM jobs LIMIT 1")
+            except sqlite3.OperationalError:
+                self.conn.execute(f"ALTER TABLE jobs ADD COLUMN {col} TEXT DEFAULT {default}")
+                self.conn.commit()
+
+        # Cloud columns on cost_tracking
+        for col, default in [
+            ("provider", "NULL"),
+            ("instance_id", "NULL"),
+            ("hourly_rate", "NULL"),
+        ]:
+            try:
+                self.conn.execute(f"SELECT {col} FROM cost_tracking LIMIT 1")
+            except sqlite3.OperationalError:
+                self.conn.execute(f"ALTER TABLE cost_tracking ADD COLUMN {col} {'TEXT' if default == 'NULL' and col != 'hourly_rate' else 'REAL'} DEFAULT {default}")
+                self.conn.commit()
 
     # ------------------------------------------------------------------
     # Job CRUD (preserved from batch_process.py + extensions)
@@ -390,13 +417,18 @@ class JobDatabase:
     # Cost tracking
     # ------------------------------------------------------------------
     def log_cost(self, job_id: str, worker_id: str, gpu_name: str,
-                 cost: float, duration_hours: float):
+                 cost: float, duration_hours: float,
+                 provider: Optional[str] = None,
+                 instance_id: Optional[str] = None,
+                 hourly_rate: Optional[float] = None):
         cost_id = str(uuid.uuid4())
         self.conn.execute("""
             INSERT INTO cost_tracking
-            (id, job_id, worker_id, gpu_name, cost, duration_hours, timestamp)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            (id, job_id, worker_id, gpu_name, cost, duration_hours,
+             provider, instance_id, hourly_rate, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (cost_id, job_id, worker_id, gpu_name, cost, duration_hours,
+              provider, instance_id, hourly_rate,
               datetime.now().isoformat()))
         self.conn.commit()
 
@@ -419,6 +451,40 @@ class JobDatabase:
                 "jobs": row[3],
             }
         return {"total_cost": round(total, 2), "by_gpu": by_gpu}
+
+    def get_total_cloud_cost(self) -> float:
+        """Get total cost for cloud providers only."""
+        row = self.conn.execute(
+            "SELECT COALESCE(SUM(cost), 0) FROM cost_tracking WHERE provider IS NOT NULL"
+        ).fetchone()
+        return float(row[0])
+
+    def get_budget_remaining(self, budget: float) -> float:
+        """Get remaining cloud budget."""
+        spent = self.get_total_cloud_cost()
+        return max(0.0, budget - spent)
+
+    def update_job_s3_keys(self, job_id: str, s3_input_key: Optional[str] = None,
+                           s3_output_key: Optional[str] = None,
+                           provider: Optional[str] = None):
+        """Update S3 keys and provider for a cloud job."""
+        updates = []
+        values = []
+        if s3_input_key is not None:
+            updates.append("s3_input_key=?")
+            values.append(s3_input_key)
+        if s3_output_key is not None:
+            updates.append("s3_output_key=?")
+            values.append(s3_output_key)
+        if provider is not None:
+            updates.append("provider=?")
+            values.append(provider)
+        if updates:
+            values.append(job_id)
+            self.conn.execute(
+                f"UPDATE jobs SET {', '.join(updates)} WHERE id=?", values
+            )
+            self.conn.commit()
 
     # ------------------------------------------------------------------
     # Lifecycle

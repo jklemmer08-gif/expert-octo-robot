@@ -12,7 +12,11 @@ from src.config import get_settings
 
 app = Celery(
     "ppp_processor",
-    include=["src.workers.local_worker", "src.workers.cloud_worker"],
+    include=[
+        "src.workers.local_worker",
+        "src.workers.cloud_worker",
+        "src.workers.cloud_worker_v2",
+    ],
 )
 
 
@@ -38,11 +42,15 @@ def _configure_celery():
         timezone="UTC",
         enable_utc=True,
         task_acks_late=True,
+        task_reject_on_worker_lost=True,
         worker_prefetch_multiplier=1,
         task_routes={
             "src.workers.local_worker.*": {"queue": "local_gpu"},
             "src.workers.cloud_worker.*": {"queue": "cloud"},
+            "src.workers.cloud_worker_v2.*": {"queue": "cloud"},
         },
+        # Cloud tasks get 4-hour hard limit
+        task_time_limit=14400,
         result_expires=86400,
         task_track_started=True,
     )
