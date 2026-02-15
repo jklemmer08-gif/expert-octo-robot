@@ -2148,37 +2148,33 @@ class MatteProcessor:
                 )
                 src_raw = np.ascontiguousarray(frame_small[np.newaxis])  # [1, H, W, 3] uint8
 
-                # OpenVINO inference → fgr + pha
-                fgr_raw, pha_raw = self._openvino_engine.infer_raw(src_raw)
-                # fgr_raw: [1, 3, infer_H, infer_W] float32
+                # OpenVINO inference → alpha only (skip fgr copy for speed)
+                pha_raw = self._openvino_engine.infer_alpha_raw(src_raw)
                 # pha_raw: [1, 1, infer_H, infer_W] float32
-
-                # Convert to HWC for post-processing
-                fgr = np.transpose(fgr_raw[0], (1, 2, 0))  # [H, W, 3]
                 pha = pha_raw[0, 0]  # [H, W]
 
-                # Optional despill (green spill removal at edges)
-                if mc.despill:
-                    fgr = self._despill_numpy(fgr, pha, mc.green_color, mc.despill_strength)
-
-                # Optional alpha refinement
+                # Optional alpha refinement (at inference resolution)
                 if mc.refine_alpha:
                     pha = self._refine_alpha_numpy(pha, mc.alpha_sharpness)
 
-                # Green screen composite at inference resolution
-                # out = green * (1 - pha) + fgr * pha
-                pha_3 = pha[:, :, np.newaxis]  # [H, W, 1]
-                composite = green * (1.0 - pha_3) + fgr * pha_3
-                composite = np.clip(composite, 0.0, 1.0)
-
-                # Upscale composite to full resolution
-                composite_u8 = (composite * 255.0).astype(np.uint8)
+                # Upscale alpha to full resolution, composite with original source
+                # This preserves full 4K detail on the person — only the matte
+                # boundary is at the lower inference resolution.
                 if (infer_w, infer_h) != (src_w, src_h):
-                    frame_out = cv2.resize(
-                        composite_u8, (src_w, src_h), interpolation=cv2.INTER_LANCZOS4,
-                    )
+                    pha_full = cv2.resize(pha, (src_w, src_h), interpolation=cv2.INTER_LINEAR)
                 else:
-                    frame_out = composite_u8
+                    pha_full = pha
+
+                # Optional despill on original source at full resolution
+                src_f32 = frame.astype(np.float32) / 255.0
+                if mc.despill:
+                    src_f32 = self._despill_numpy(src_f32, pha_full, mc.green_color, mc.despill_strength)
+
+                # Green screen composite at full resolution
+                # out = green * (1 - pha) + src * pha
+                pha_3 = pha_full[:, :, np.newaxis]  # [H, W, 1]
+                composite = green * (1.0 - pha_3) + src_f32 * pha_3
+                frame_out = np.clip(composite * 255.0, 0.0, 255.0).astype(np.uint8)
 
                 encode_q.put(frame_out)
 
