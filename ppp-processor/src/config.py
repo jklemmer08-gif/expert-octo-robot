@@ -157,6 +157,12 @@ class MatteConfig(BaseSettings):
     despill: bool = False            # Green spill removal on foreground edges
     despill_strength: float = 0.8    # Despill intensity (0.0-1.0)
     alpha_sharpness: str = "fine"    # Refine mode: "fine" (multi-scale) or "soft" (legacy)
+    refine_laplacian_strength: float = 0.3  # Laplacian edge sharpening intensity
+    refine_threshold_low: float = 0.01      # Alpha below this → 0 (black separation)
+    refine_threshold_high: float = 0.99     # Alpha above this → 1 (white separation)
+    refine_morph_kernel: int = 5            # Morph close/open kernel size (px)
+    despill_dilation_kernel: int = 7        # Despill edge mask dilation kernel (px)
+    despill_dilation_iters: int = 2         # Despill edge mask dilation iterations
     output_scale: float = 1.0       # Downscale output (0.5 = 50% res, faster; 1.0 = full res)
     min_output_width: int = 1920     # Never scale below this width (1920px horizontal floor)
     channels_last: bool = True       # NHWC memory format for tensor core acceleration

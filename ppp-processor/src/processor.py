@@ -2176,7 +2176,13 @@ class MatteProcessor:
 
                 # Optional alpha refinement (at inference resolution)
                 if mc.refine_alpha:
-                    pha = self._refine_alpha_numpy(pha, mc.alpha_sharpness)
+                    pha = self._refine_alpha_numpy(
+                        pha, mc.alpha_sharpness,
+                        threshold_low=mc.refine_threshold_low,
+                        threshold_high=mc.refine_threshold_high,
+                        laplacian_strength=mc.refine_laplacian_strength,
+                        morph_kernel_size=mc.refine_morph_kernel,
+                    )
 
                 # Upscale alpha to full resolution as uint8 for fast compositing
                 pha_u8 = np.clip(pha * 255.0, 0.0, 255.0).astype(np.uint8)
@@ -2185,7 +2191,11 @@ class MatteProcessor:
 
                 # Optional despill on original source at full resolution (uint8 path)
                 if mc.despill:
-                    frame = self._despill_numpy_u8(frame, pha_u8, mc.despill_strength)
+                    frame = self._despill_numpy_u8(
+                        frame, pha_u8, mc.despill_strength,
+                        dilation_kernel=mc.despill_dilation_kernel,
+                        dilation_iters=mc.despill_dilation_iters,
+                    )
 
                 # Green screen composite using OpenCV (multi-threaded C++, bypasses GIL).
                 # out = src * (alpha/255) + green * (1 - alpha/255)
@@ -2282,6 +2292,8 @@ class MatteProcessor:
         frame: "np.ndarray",
         pha_u8: "np.ndarray",
         strength: float = 0.8,
+        dilation_kernel: int = 7,
+        dilation_iters: int = 2,
     ) -> "np.ndarray":
         """Remove green spill from edges using uint8 data. Modifies frame in-place.
 
@@ -2289,6 +2301,8 @@ class MatteProcessor:
             frame: [H, W, 3] uint8 source frame
             pha_u8: [H, W] uint8 alpha (0-255)
             strength: despill intensity (0-1)
+            dilation_kernel: size of dilation kernel (px)
+            dilation_iters: number of dilation iterations
 
         Returns:
             frame with green channel clamped at edge transitions.
@@ -2298,8 +2312,8 @@ class MatteProcessor:
 
         # Edge mask: transition zone (roughly 5-250 in uint8 = 0.02-0.98)
         edge_mask = ((pha_u8 > 5) & (pha_u8 < 250)).astype(np.uint8)
-        kernel = np.ones((5, 5), dtype=np.uint8)
-        edge_mask = cv2.dilate(edge_mask, kernel, iterations=1)
+        kernel = np.ones((dilation_kernel, dilation_kernel), dtype=np.uint8)
+        edge_mask = cv2.dilate(edge_mask, kernel, iterations=dilation_iters)
 
         # Only process pixels in the edge mask for speed
         mask_idx = edge_mask > 0
@@ -2316,12 +2330,23 @@ class MatteProcessor:
         return frame
 
     @staticmethod
-    def _refine_alpha_numpy(pha: "np.ndarray", sharpness: str = "fine") -> "np.ndarray":
+    def _refine_alpha_numpy(
+        pha: "np.ndarray",
+        sharpness: str = "fine",
+        threshold_low: float = 0.01,
+        threshold_high: float = 0.99,
+        laplacian_strength: float = 0.3,
+        morph_kernel_size: int = 5,
+    ) -> "np.ndarray":
         """Refine alpha matte using OpenCV box-filter guided filter.
 
         Args:
             pha: [H, W] float32 alpha (0-1)
             sharpness: "fine" for multi-scale + sharpening, "soft" for legacy
+            threshold_low: alpha below this → 0 (black separation)
+            threshold_high: alpha above this → 1 (white separation)
+            laplacian_strength: edge sharpening intensity
+            morph_kernel_size: kernel size for morphological open/close (px)
 
         Returns:
             Refined alpha [H, W] float32.
@@ -2341,15 +2366,17 @@ class MatteProcessor:
             mean_b = cv2.blur(b, (k, k))
             return mean_a * p + mean_b
 
+        kernel = np.ones((morph_kernel_size, morph_kernel_size), dtype=np.uint8)
+
         if sharpness == "soft":
             # Single-scale guided filter
             pha = _guided_filter_gray(pha, radius=8)
             pha = np.clip(pha, 0.0, 1.0)
             pha[pha < 0.05] = 0.0
             pha[pha > 0.95] = 1.0
-            # Morphological close (3px)
-            kernel = np.ones((3, 3), dtype=np.uint8)
+            # Morphological open (remove specks) then close (fill gaps)
             pha_u8 = (pha * 255).astype(np.uint8)
+            pha_u8 = cv2.morphologyEx(pha_u8, cv2.MORPH_OPEN, kernel)
             pha_u8 = cv2.morphologyEx(pha_u8, cv2.MORPH_CLOSE, kernel)
             pha = pha_u8.astype(np.float32) / 255.0
         else:
@@ -2363,9 +2390,9 @@ class MatteProcessor:
             blend_w = np.clip(local_var * 50.0, 0.0, 1.0)
             pha = pha_bulk * (1.0 - blend_w) + pha_fine * blend_w
 
-            # Tighter thresholds
+            # Threshold separation
             pha = np.clip(pha, 0.0, 1.0)
-            lo, hi = 0.02, 0.98
+            lo, hi = threshold_low, threshold_high
             mask_lo = (pha < lo).astype(np.float32)
             mask_hi = (pha > hi).astype(np.float32)
             mask_mid = 1.0 - mask_lo - mask_hi
@@ -2374,11 +2401,11 @@ class MatteProcessor:
 
             # Laplacian edge sharpening
             laplacian = cv2.Laplacian(pha, cv2.CV_32F, ksize=3)
-            pha = np.clip(pha + 0.15 * laplacian, 0.0, 1.0)
+            pha = np.clip(pha + laplacian_strength * laplacian, 0.0, 1.0)
 
-            # Morphological close (2px — preserve fine hair)
-            kernel = np.ones((3, 3), dtype=np.uint8)
+            # Morphological open (remove floating alpha specks) then close (fill edge gaps)
             pha_u8 = (pha * 255).astype(np.uint8)
+            pha_u8 = cv2.morphologyEx(pha_u8, cv2.MORPH_OPEN, kernel)
             pha_u8 = cv2.morphologyEx(pha_u8, cv2.MORPH_CLOSE, kernel)
             pha = pha_u8.astype(np.float32) / 255.0
 

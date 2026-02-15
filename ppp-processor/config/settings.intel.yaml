@@ -28,8 +28,14 @@ matte:
   output_type: "alpha_pack"
   refine_alpha: true
   despill: true
-  despill_strength: 0.8
+  despill_strength: 1.0
   alpha_sharpness: "fine"
+  refine_laplacian_strength: 0.3
+  refine_threshold_low: 0.01
+  refine_threshold_high: 0.99
+  refine_morph_kernel: 5
+  despill_dilation_kernel: 7
+  despill_dilation_iters: 2
   output_scale: 0.5
   channels_last: false
   cuda_graphs_pytorch: false
