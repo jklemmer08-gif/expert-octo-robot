@@ -10,8 +10,12 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import yaml
+from dotenv import load_dotenv
 from pydantic import Field
 from pydantic_settings import BaseSettings
+
+# Load .env from project root (next to config/)
+load_dotenv(Path(__file__).parent.parent / ".env")
 
 
 class PathsConfig(BaseSettings):
@@ -153,6 +157,7 @@ class MatteConfig(BaseSettings):
     despill: bool = False            # Green spill removal on foreground edges
     despill_strength: float = 0.8    # Despill intensity (0.0-1.0)
     alpha_sharpness: str = "fine"    # Refine mode: "fine" (multi-scale) or "soft" (legacy)
+    output_scale: float = 1.0       # Downscale output (0.75 = 75% res, faster; 1.0 = full res)
     channels_last: bool = True       # NHWC memory format for tensor core acceleration
     cuda_graphs_pytorch: bool = True # CUDA Graphs for PyTorch fallback (Windows)
     # Intel/OpenVINO settings

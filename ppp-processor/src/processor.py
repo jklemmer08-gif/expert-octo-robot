@@ -2027,20 +2027,33 @@ class MatteProcessor:
             progress_callback("probing", 1)
 
         probe = self._probe_video_pipe_info(input_path)
-        src_w, src_h = probe["width"], probe["height"]
+        orig_w, orig_h = probe["width"], probe["height"]
         fps_str = probe["fps_str"]
         total_frames = probe["total_frames"]
 
-        # Inference at downsample_ratio scale, composite at full resolution
+        # Optional output downscale: reduces pipe data, composite, and encode work.
+        # output_scale=0.75 on 4K → 2880x1620, ~2x faster with ~5% quality loss.
+        out_scale = mc.output_scale
+        if out_scale < 1.0:
+            src_w = int(orig_w * out_scale)
+            src_h = int(orig_h * out_scale)
+            # Ensure even dimensions for encoder
+            src_w += src_w % 2
+            src_h += src_h % 2
+        else:
+            src_w, src_h = orig_w, orig_h
+
+        # Inference at downsample_ratio of the output resolution
         infer_h = int(src_h * mc.downsample_ratio)
         infer_w = int(src_w * mc.downsample_ratio)
-        # Ensure even dimensions
         infer_h += infer_h % 2
         infer_w += infer_w % 2
 
         logger.info(
-            "Intel 2D: %dx%d → infer at %dx%d (%.0f%%), despill=%s, refine=%s",
-            src_w, src_h, infer_w, infer_h, mc.downsample_ratio * 100,
+            "Intel 2D: %dx%d%s → infer at %dx%d (%.0f%%), despill=%s, refine=%s",
+            src_w, src_h,
+            f" (scaled from {orig_w}x{orig_h})" if out_scale < 1.0 else "",
+            infer_w, infer_h, mc.downsample_ratio * 100,
             mc.despill, mc.refine_alpha,
         )
 
@@ -2050,9 +2063,10 @@ class MatteProcessor:
             logger.error("OpenVINO engine not available for Intel 2D matting")
             return False
 
-        # Green color removed — composite now uses uint8 integer math
+        # Pre-allocate green background (float32 for OpenCV blend)
+        green_bg = np.full((src_h, src_w, 3), mc.green_color, dtype=np.float32)
 
-        # --- Decode pipe ---
+        # --- Decode pipe (with optional scale filter) ---
         frame_bytes = src_w * src_h * 3
         pipe_bufsize = frame_bytes * 4
 
@@ -2060,8 +2074,12 @@ class MatteProcessor:
             "ffmpeg", "-hide_banner", "-loglevel", "error",
             "-threads", "0",
             "-i", str(input_path),
-            "-pix_fmt", "rgb24", "-f", "rawvideo", "-v", "error", "pipe:1",
         ]
+        if out_scale < 1.0:
+            decode_cmd.extend(["-vf", f"scale={src_w}:{src_h}"])
+        decode_cmd.extend([
+            "-pix_fmt", "rgb24", "-f", "rawvideo", "-v", "error", "pipe:1",
+        ])
 
         # --- Encode pipe ---
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2166,17 +2184,14 @@ class MatteProcessor:
                 if mc.despill:
                     frame = self._despill_numpy_u8(frame, pha_u8, mc.despill_strength)
 
-                # Green screen composite at full resolution using uint16 integer math.
-                # out = (green * (255-a) + src * a + 128) / 255
-                # Avoids expensive float32 conversion of 4K frame.
-                alpha_3 = np.stack([pha_u8, pha_u8, pha_u8], axis=2)  # [H, W, 3] uint8
-                inv_alpha = 255 - alpha_3
-                green_u8 = np.array(mc.green_color, dtype=np.uint8)
-                frame_out = (
-                    (green_u8.astype(np.uint16) * inv_alpha
-                     + frame.astype(np.uint16) * alpha_3
-                     + 128) // 255
-                ).astype(np.uint8)
+                # Green screen composite using OpenCV (multi-threaded C++, bypasses GIL).
+                # out = src * (alpha/255) + green * (1 - alpha/255)
+                alpha_f32 = pha_u8.astype(np.float32) / 255.0
+                alpha_3 = cv2.merge([alpha_f32, alpha_f32, alpha_f32])
+                frame_out = cv2.convertScaleAbs(
+                    frame.astype(np.float32) * alpha_3
+                    + green_bg * (1.0 - alpha_3)
+                )
 
                 encode_q.put(frame_out)
 
