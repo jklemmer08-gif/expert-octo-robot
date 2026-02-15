@@ -158,7 +158,7 @@ class MatteConfig(BaseSettings):
     despill_strength: float = 0.8    # Despill intensity (0.0-1.0)
     alpha_sharpness: str = "fine"    # Refine mode: "fine" (multi-scale) or "soft" (legacy)
     output_scale: float = 1.0       # Downscale output (0.5 = 50% res, faster; 1.0 = full res)
-    min_output_height: int = 1080    # Never scale below this height (Quest 3S perceptual limit)
+    min_output_height: int = 1440    # Never scale below this height (Quest 3S @ 1.4x zoom)
     channels_last: bool = True       # NHWC memory format for tensor core acceleration
     cuda_graphs_pytorch: bool = True # CUDA Graphs for PyTorch fallback (Windows)
     # Intel/OpenVINO settings
