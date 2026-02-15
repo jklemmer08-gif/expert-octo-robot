@@ -2197,6 +2197,10 @@ class MatteProcessor:
                     data = encode_q.get()
                     if data is SENTINEL:
                         break
+                    # Accept either ndarray or bytes; tobytes() in encode thread
+                    # overlaps with next frame's GPU inference in main thread
+                    if isinstance(data, np.ndarray):
+                        data = data.tobytes()
                     encoder.stdin.write(data)
             except Exception as e:
                 encode_error[0] = e
@@ -2250,8 +2254,10 @@ class MatteProcessor:
                 # Pack alpha into corner dead zones (modifies frame in-place)
                 packer.pack(frame, alpha, eye_width=eye_w)
 
-                # Write packed frame to encode pipe
-                encode_q.put(frame.tobytes())
+                # Pass frame array to encode thread — tobytes runs there, overlapping
+                # with next frame's GPU inference. frame is freshly allocated each
+                # iteration (from frombuffer().copy()), so no aliasing risk.
+                encode_q.put(frame)
 
                 frame_idx += 1
                 if frame_idx % mc.progress_interval == 0:
