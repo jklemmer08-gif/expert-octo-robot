@@ -2117,11 +2117,28 @@ class MatteProcessor:
         fps_str = probe["fps_str"]
         total_frames = probe["total_frames"]
 
-        # Prepare inference engine (OpenVINO on Intel, ORT/PyTorch on NVIDIA)
-        self._prepare_inference_engine(full_h, eye_w)
-
         # Alpha packer
         packer = AlphaPacker(scale=mc.alpha_pack_scale)
+
+        # For alpha packing, we only need the matte at the pack scale.
+        # Downscaling the eye BEFORE inference saves ~4x compute at 4K.
+        infer_h = int(full_h * mc.alpha_pack_scale)
+        infer_w = int(eye_w * mc.alpha_pack_scale)
+        use_downscaled_infer = (
+            self._openvino_engine is not None
+            or (self._platform == "intel")
+        )
+        if use_downscaled_infer:
+            logger.info(
+                "Alpha pack: inferring at %dx%d (%.0f%% of %dx%d eye)",
+                infer_w, infer_h, mc.alpha_pack_scale * 100, eye_w, full_h,
+            )
+
+        # Prepare inference engine at the resolution we'll actually infer at
+        if use_downscaled_infer:
+            self._prepare_inference_engine(infer_h, infer_w)
+        else:
+            self._prepare_inference_engine(full_h, eye_w)
 
         # --- FFmpeg decode pipe (full SBS frame, RGB24) ---
         frame_bytes = full_w * full_h * 3
@@ -2230,29 +2247,27 @@ class MatteProcessor:
                 # Crop left eye (NumPy slice — zero copy for read)
                 left_eye = frame[:, :eye_w, :]
 
-                # Inference — prefer alpha-only raw uint8 path (GPU preprocessing) if available
-                if self._openvino_engine is not None and self._openvino_engine.has_raw_input:
-                    # Direct uint8 NHWC input — normalize+transpose on GPU, skip fgr copy
-                    src_raw = np.ascontiguousarray(left_eye[np.newaxis])  # [1, H, W, 3] uint8
+                # Inference — prefer downscaled raw uint8 path for alpha packing
+                if use_downscaled_infer and self._openvino_engine is not None and self._openvino_engine.has_raw_input:
+                    # Downscale eye to pack resolution before inference (~4x fewer pixels)
+                    eye_small = cv2.resize(left_eye, (infer_w, infer_h), interpolation=cv2.INTER_AREA)
+                    src_raw = np.ascontiguousarray(eye_small[np.newaxis])  # [1, H, W, 3] uint8
                     pha = self._openvino_engine.infer_alpha_raw(src_raw)
+                    alpha = pha[0, 0]  # [infer_H, infer_W] float32 — already at pack scale
+                    packer.pack(frame, alpha, eye_width=eye_w, presized=True)
                 else:
-                    # CPU normalize path (ORT/PyTorch/OpenVINO fallback)
+                    # Full-resolution path (ORT/PyTorch/OpenVINO fallback)
                     src = left_eye.astype(np.float32) / 255.0
                     src = np.transpose(src, (2, 0, 1))  # HWC → CHW
                     src = np.expand_dims(src, 0)  # CHW → NCHW
                     fgr, pha, *rec = self._infer_frame(src, rec, mc.downsample_ratio)
-
-                # Extract alpha matte [H, W] float32
-                if hasattr(pha, 'cpu'):
-                    # PyTorch tensor path
-                    alpha = pha[0, 0].cpu().numpy()
-                elif isinstance(pha, np.ndarray):
-                    alpha = pha[0, 0] if pha.ndim == 4 else pha
-                else:
-                    alpha = np.array(pha[0, 0])
-
-                # Pack alpha into corner dead zones (modifies frame in-place)
-                packer.pack(frame, alpha, eye_width=eye_w)
+                    if hasattr(pha, 'cpu'):
+                        alpha = pha[0, 0].cpu().numpy()
+                    elif isinstance(pha, np.ndarray):
+                        alpha = pha[0, 0] if pha.ndim == 4 else pha
+                    else:
+                        alpha = np.array(pha[0, 0])
+                    packer.pack(frame, alpha, eye_width=eye_w)
 
                 # Pass frame array to encode thread — tobytes runs there, overlapping
                 # with next frame's GPU inference. frame is freshly allocated each
