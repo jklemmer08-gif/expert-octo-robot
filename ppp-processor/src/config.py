@@ -158,7 +158,7 @@ class MatteConfig(BaseSettings):
     despill_strength: float = 0.8    # Despill intensity (0.0-1.0)
     alpha_sharpness: str = "fine"    # Refine mode: "fine" (multi-scale) or "soft" (legacy)
     output_scale: float = 1.0       # Downscale output (0.5 = 50% res, faster; 1.0 = full res)
-    min_output_height: int = 1080    # Never scale below this height (1080p floor)
+    min_output_width: int = 1920     # Never scale below this width (1920px horizontal floor)
     channels_last: bool = True       # NHWC memory format for tensor core acceleration
     cuda_graphs_pytorch: bool = True # CUDA Graphs for PyTorch fallback (Windows)
     # Intel/OpenVINO settings
