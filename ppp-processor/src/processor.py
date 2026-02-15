@@ -2032,10 +2032,10 @@ class MatteProcessor:
         total_frames = probe["total_frames"]
 
         # Smart output downscale: scale down only when source exceeds the display's
-        # perceptual limit (min_output_height, default 1080 for Quest 3S).
-        # Never upscale, never go below min_output_height.
-        min_h = mc.min_output_height
-        out_scale = min(1.0, max(mc.output_scale, min_h / orig_h)) if orig_h > min_h else 1.0
+        # perceptual limit (min_output_width, default 1920).
+        # Never upscale, never go below min_output_width.
+        min_w = mc.min_output_width
+        out_scale = min(1.0, max(mc.output_scale, min_w / orig_w)) if orig_w > min_w else 1.0
         if out_scale < 1.0:
             src_w = int(orig_w * out_scale)
             src_h = int(orig_h * out_scale)
