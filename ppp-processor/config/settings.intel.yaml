@@ -30,7 +30,7 @@ matte:
   despill: true
   despill_strength: 0.8
   alpha_sharpness: "fine"
-  output_scale: 0.75
+  output_scale: 0.5
   channels_last: false
   cuda_graphs_pytorch: false
   openvino_device: "GPU"
