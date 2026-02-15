@@ -2209,16 +2209,23 @@ class MatteProcessor:
                 decode_q.put(SENTINEL)
 
         def encode_thread():
+            import os
             try:
+                fd = encoder.stdin.fileno()
                 while True:
                     data = encode_q.get()
                     if data is SENTINEL:
                         break
-                    # Accept either ndarray or bytes; tobytes() in encode thread
-                    # overlaps with next frame's GPU inference in main thread
+                    # Use os.write with memoryview for zero-copy pipe write.
+                    # Avoids the 33ms tobytes() copy for 96MB 8K frames.
                     if isinstance(data, np.ndarray):
-                        data = data.tobytes()
-                    encoder.stdin.write(data)
+                        mv = memoryview(data)
+                        total = mv.nbytes
+                        written = 0
+                        while written < total:
+                            written += os.write(fd, mv[written:])
+                    else:
+                        encoder.stdin.write(data)
             except Exception as e:
                 encode_error[0] = e
 
