@@ -137,21 +137,52 @@ def process_job(self: LocalGPUTask, job_id: str):
             )
 
             output_path = Path(platform_path(job["output_path"]))
+            # Alpha pack output: append _FISHEYE190_alpha suffix
+            if settings.matte.output_type == "alpha_pack" and info.is_vr:
+                stem = output_path.stem
+                if "_FISHEYE190_alpha" not in stem:
+                    output_path = output_path.with_stem(stem + "_FISHEYE190_alpha")
             output_path.parent.mkdir(parents=True, exist_ok=True)
 
             matte_proc = MatteProcessor(settings)
-            if info.is_vr and info.vr_type == "sbs":
-                success = matte_proc.process_vr_sbs(
-                    local_source, output_path, info, progress_callback,
-                )
-            else:
-                success = matte_proc.process_video(
-                    local_source, output_path, info, progress_callback,
-                )
+            try:
+                if info.is_vr and info.vr_type == "sbs":
+                    success = matte_proc.process_vr_sbs(
+                        local_source, output_path, info, progress_callback,
+                    )
+                else:
+                    success = matte_proc.process_video(
+                        local_source, output_path, info, progress_callback,
+                    )
+            finally:
+                # Release inference engine resources before next job to prevent
+                # context corruption in Celery's solo pool.
+                if matte_proc._openvino_engine is not None:
+                    matte_proc._openvino_engine.cleanup()
+                    matte_proc._openvino_engine = None
+                if matte_proc._ort_engine is not None:
+                    matte_proc._ort_engine.cleanup()
+                    matte_proc._ort_engine = None
+                if matte_proc._trt_engine is not None:
+                    matte_proc._trt_engine.cleanup()
+                    matte_proc._trt_engine = None
 
             processing_time = time.time() - start_time
 
             if success and output_path.exists() and output_path.stat().st_size > 1024:
+                # Tag original scene in Stash so user knows matte is available
+                scene_id = job.get("scene_id")
+                if scene_id:
+                    try:
+                        from src.integrations.stash import StashClient
+                        stash = StashClient(settings.paths.stash_url)
+                        stash.add_tag_to_scene(scene_id, "Green Screen Available")
+                        stash.add_tag_to_scene(scene_id, "PPP-Processed")
+                        stash.add_tag_to_scene(scene_id, "Passthrough_simple")
+                        logger.info("Tagged scene %s with 'Green Screen Available' + 'Passthrough_simple'", scene_id)
+                    except Exception as e:
+                        logger.warning("Stash tagging failed (non-fatal): %s", e)
+
                 self.db.update_job_status(
                     job_id, JobStatus.COMPLETED.value,
                     processing_time=processing_time,
