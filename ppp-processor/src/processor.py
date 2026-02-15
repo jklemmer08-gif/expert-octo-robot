@@ -2226,11 +2226,11 @@ class MatteProcessor:
                 # Crop left eye (NumPy slice — zero copy for read)
                 left_eye = frame[:, :eye_w, :]
 
-                # Inference — prefer raw uint8 path (GPU preprocessing) if available
+                # Inference — prefer alpha-only raw uint8 path (GPU preprocessing) if available
                 if self._openvino_engine is not None and self._openvino_engine.has_raw_input:
-                    # Direct uint8 NHWC input — normalize+transpose runs on GPU
+                    # Direct uint8 NHWC input — normalize+transpose on GPU, skip fgr copy
                     src_raw = np.ascontiguousarray(left_eye[np.newaxis])  # [1, H, W, 3] uint8
-                    fgr, pha = self._openvino_engine.infer_raw(src_raw)
+                    pha = self._openvino_engine.infer_alpha_raw(src_raw)
                 else:
                     # CPU normalize path (ORT/PyTorch/OpenVINO fallback)
                     src = left_eye.astype(np.float32) / 255.0
