@@ -360,6 +360,80 @@ def detect_vr_type(video_path: Path, width: int, height: int) -> str:
     return vr_type if is_vr else "2d"
 
 
+def compute_target_resolution(
+    src_w: int, src_h: int, vr_type: str,
+) -> Optional[tuple]:
+    """Compute upscale target resolution based on source dimensions.
+
+    2D rules (by height):
+      ≤1080p → min(2x height, 1440p), scale width proportionally
+      >1080p → no upscale
+
+    VR SBS rules (by full frame width):
+      <6144  → 6144 wide (6K)
+      <8192  → 8192 wide (8K)
+      ≥8192  → no upscale
+
+    Returns (target_w, target_h) or None if no upscale needed.
+    """
+    if vr_type == "sbs":
+        if src_w < 6144:
+            target_w = 6144
+        elif src_w < 8192:
+            target_w = 8192
+        else:
+            return None
+        # Scale height proportionally, ensure even
+        target_h = int(src_h * target_w / src_w)
+        target_h = target_h + (target_h % 2)
+        target_w = target_w + (target_w % 2)
+        return (target_w, target_h)
+
+    elif vr_type == "2d" or vr_type == "tb":
+        if src_h > 1080:
+            return None
+        target_h = min(src_h * 2, 1440)
+        # Ensure even
+        target_h = target_h + (target_h % 2)
+        target_w = int(src_w * target_h / src_h)
+        target_w = target_w + (target_w % 2)
+        return (target_w, target_h)
+
+    return None
+
+
+def rescale_video(
+    input_path: Path,
+    output_path: Path,
+    target_w: int,
+    target_h: int,
+    bitrate: str = "15M",
+) -> bool:
+    """Rescale a video to target resolution using FFmpeg lanczos."""
+    temp_path = input_path.with_suffix(".tmp.mp4")
+    input_path.rename(temp_path)
+
+    cmd = build_encode_cmd(
+        ["-i", str(temp_path)],
+        output_path,
+        bitrate,
+        extra_input_args=[
+            "-vf", f"scale={target_w}:{target_h}:flags=lanczos",
+            "-map", "0:v",
+        ],
+        extra_output_args=["-map", "0:a?", "-c:a", "copy"],
+    )
+
+    logger.info("Rescaling %s → %dx%d (lanczos)", input_path.name, target_w, target_h)
+    result = subprocess.run(cmd, capture_output=True, text=True, env=_ffmpeg_env())
+    temp_path.unlink(missing_ok=True)
+
+    if result.returncode != 0:
+        logger.error("Rescale failed: %s", result.stderr[-500:])
+        return False
+    return True
+
+
 # ---------------------------------------------------------------------------
 # NVENC probe (from processor.py:534)
 # ---------------------------------------------------------------------------
@@ -1429,22 +1503,34 @@ def handler(job: dict) -> dict:
             despill_dilation_iters=despill_dilation_iters,
         )
 
-        # 6. Process
+        # 6. Compute smart upscale target
+        target_res = compute_target_resolution(
+            probe["width"], probe["height"], vr_type,
+        )
+        if target_res:
+            logger.info(
+                "Auto-upscale: %dx%d → %dx%d (lanczos)",
+                probe["width"], probe["height"], target_res[0], target_res[1],
+            )
+        else:
+            logger.info("No auto-upscale needed for %dx%d", probe["width"], probe["height"])
+
+        # 7. Process
         try:
             if vr_type == "sbs":
-                # Target resolution for VR: original full SBS width x height
-                target_res = (probe["width"], probe["height"]) if fast_decode else None
+                # For VR SBS: use smart target, or at least restore to original if fast_decode shrunk it
+                sbs_target = target_res or ((probe["width"], probe["height"]) if fast_decode else None)
                 success = process_vr_sbs(
                     input_path, output_path, probe,
                     green_color=green_color,
                     downsample_ratio=downsample_ratio,
                     bitrate=vr_encode_bitrate,
                     alpha_output_path=alpha_local_path,
-                    target_resolution=target_res,
+                    target_resolution=sbs_target,
                     **pipeline_kwargs,
                 )
             else:
-                # 2D or TB (TB treated as 2D for now — matte full frame)
+                # 2D or TB — matte full frame
                 success = process_video_streaming(
                     input_path, output_path, probe,
                     green_color=green_color,
@@ -1459,6 +1545,12 @@ def handler(job: dict) -> dict:
 
         if not success:
             return {"error": "Matting pipeline returned failure"}
+
+        # 8. Post-matte rescale for 2D/TB (VR SBS handled in merge step)
+        if target_res and vr_type != "sbs" and output_path.exists():
+            tw, th = target_res
+            if not rescale_video(output_path, output_path, tw, th, encode_bitrate):
+                logger.warning("Rescale failed, uploading at model resolution")
 
         # 7. Upload result(s) to S3
         try:
@@ -1482,7 +1574,8 @@ def handler(job: dict) -> dict:
             "output_key": output_key,
             "output_mode": output_mode,
             "vr_type": vr_type,
-            "resolution": f"{probe['width']}x{probe['height']}",
+            "source_resolution": f"{probe['width']}x{probe['height']}",
+            "output_resolution": f"{target_res[0]}x{target_res[1]}" if target_res else f"{probe['width']}x{probe['height']}",
             "total_frames": probe["total_frames"],
             "duration_seconds": probe["duration"],
             "output_size_mb": round(output_size_mb, 1),
