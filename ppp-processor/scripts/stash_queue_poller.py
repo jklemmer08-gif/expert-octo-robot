@@ -40,6 +40,7 @@ logger = logging.getLogger("ppp.poller")
 INPUT_TAG = "PPP-Queue"
 QUEUED_TAG = "PPP-Queued"
 PROCESSING_TAG = "PPP-Processing"
+PROCESSED_TAG = "PPP-Processed"
 PRIORITY = 200
 QUEUE = "local_gpu_priority"
 
@@ -57,6 +58,14 @@ def poll_once(stash: StashClient, db: JobDatabase, settings) -> int:
     for scene in scenes:
         scene_id = scene["id"]
         title = scene.get("title") or f"scene-{scene_id}"
+
+        # Skip scenes already processed
+        scene_tags = [t.get("name", "") for t in scene.get("tags", [])]
+        if PROCESSED_TAG in scene_tags:
+            logger.info("Scene %s already tagged '%s', skipping", scene_id, PROCESSED_TAG)
+            stash.remove_tag_from_scene(scene_id, INPUT_TAG)
+            continue
+
         files = scene.get("files", [])
         if not files:
             logger.warning("Scene %s has no files, skipping", scene_id)
