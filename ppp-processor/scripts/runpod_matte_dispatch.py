@@ -28,6 +28,7 @@ import json
 import os
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 import boto3
@@ -164,6 +165,13 @@ def dispatch_file(
     config: dict,
     runpod: RunPodClient,
     scene_id: str | None = None,
+    output_mode: str = "green_screen",
+    despill: bool = False,
+    despill_strength: float = 0.8,
+    refine_alpha: bool = False,
+    alpha_sharpness: str = "fine",
+    upscale: bool = False,
+    upscale_model: str = "RealESRGAN_x4plus",
 ) -> str | None:
     """Dispatch a single file for RunPod matting. Returns job ID or None."""
     if not file_path.exists():
@@ -191,13 +199,50 @@ def dispatch_file(
         "green_color": mc.green_color,
         "vr_encode_bitrate": mc.vr_encode_bitrate,
         "encode_bitrate": mc.encode_bitrate,
+        "output_mode": output_mode,
+        "despill": despill,
+        "despill_strength": despill_strength,
+        "refine_alpha": refine_alpha,
+        "alpha_sharpness": alpha_sharpness,
+        "upscale": upscale,
+        "upscale_model": upscale_model,
+        # Quality tuning params from config
+        "refine_threshold_low": mc.refine_threshold_low,
+        "refine_threshold_high": mc.refine_threshold_high,
+        "refine_laplacian_strength": mc.refine_laplacian_strength,
+        "refine_morph_kernel": mc.refine_morph_kernel,
+        "despill_dilation_kernel": mc.despill_dilation_kernel,
+        "despill_dilation_iters": mc.despill_dilation_iters,
     }
+
+    # Auto-generate alpha output key for alpha_xalpha mode
+    if output_mode == "alpha_xalpha":
+        job_input["alpha_output_key"] = f"ppp-matte/output/{file_path.stem}_matted_XALPHA.mp4"
 
     # Submit to RunPod
     job_id = runpod.submit(job_input)
     print(f"  Submitted RunPod job: {job_id}")
+    print(f"  Mode: {output_mode}, despill={despill}, refine={refine_alpha}, upscale={upscale}")
+
+    _notify_dashboard(job_id, job_input)
 
     return job_id
+
+
+def _notify_dashboard(job_id: str, job_input: dict) -> None:
+    """Append job info to JSONL dropbox for the dashboard to ingest."""
+    try:
+        jsonl_path = _project_root / "data" / "runpod_jobs.jsonl"
+        jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+        record = {
+            "job_id": job_id,
+            "job_input": job_input,
+            "submitted_at": datetime.now().isoformat(),
+        }
+        with open(jsonl_path, "a") as f:
+            f.write(json.dumps(record) + "\n")
+    except Exception:
+        pass  # Best-effort — never break dispatch
 
 
 def poll_job(
@@ -224,21 +269,37 @@ def poll_job(
             output = status.get("output", {})
             if isinstance(output, dict) and output.get("status") == "success":
                 output_key = output["output_key"]
+                output_mode_result = output.get("output_mode", "green_screen")
                 vr_type = output.get("vr_type", "?")
                 proc_time = output.get("processing_time_seconds", 0)
                 output_mb = output.get("output_size_mb", 0)
 
-                print(f"  Job completed! VR={vr_type}, {proc_time:.0f}s, {output_mb:.1f} MB")
+                print(f"  Job completed! VR={vr_type}, mode={output_mode_result}, {proc_time:.0f}s, {output_mb:.1f} MB")
 
                 # Download result from S3
                 result_filename = Path(output_key).name
                 local_output = output_dir / result_filename
                 download_from_s3(bucket, output_key, local_output, region)
 
+                # Download alpha file if alpha_xalpha mode
+                alpha_output_key = output.get("alpha_output_key")
+                if alpha_output_key:
+                    alpha_filename = Path(alpha_output_key).name
+                    # Place alpha alongside the main video (HereSphere auto-detects)
+                    local_alpha = local_output.parent / alpha_filename
+                    try:
+                        download_from_s3(bucket, alpha_output_key, local_alpha, region)
+                        print(f"  Alpha: {local_alpha}")
+                    except Exception as e:
+                        print(f"  WARNING: Alpha download failed: {e}")
+
                 # Tag scene in Stash
                 if scene_id and stash:
                     try:
-                        stash.add_tag_to_scene(scene_id, "Green Screen Available")
+                        if output_mode_result == "alpha_xalpha":
+                            stash.add_tag_to_scene(scene_id, "Alpha Available")
+                        else:
+                            stash.add_tag_to_scene(scene_id, "Green Screen Available")
                         stash.add_tag_to_scene(scene_id, "PPP-Processed")
                         stash.add_tag_to_scene(scene_id, "Passthrough_simple")
                         print(f"  Tagged scene {scene_id} in Stash")
@@ -276,10 +337,11 @@ def poll_job(
     return False
 
 
-def dispatch_scenes(scene_ids: list[str], config: dict):
+def dispatch_scenes(scene_ids: list[str], config: dict, pipeline_kwargs: dict | None = None):
     """Dispatch multiple scenes by Stash scene ID."""
     stash = StashClient(config["stash_url"], config["stash_api_key"])
     runpod_client = RunPodClient(config["api_key"], config["endpoint_id"])
+    pkw = pipeline_kwargs or {}
 
     jobs = []
 
@@ -299,7 +361,7 @@ def dispatch_scenes(scene_ids: list[str], config: dict):
         local_path = to_local_path(docker_path)
         print(f"  File: {local_path}")
 
-        job_id = dispatch_file(local_path, config, runpod_client, scene_id)
+        job_id = dispatch_file(local_path, config, runpod_client, scene_id, **pkw)
         if job_id:
             jobs.append((job_id, scene_id))
 
@@ -311,15 +373,16 @@ def dispatch_scenes(scene_ids: list[str], config: dict):
             poll_job(job_id, config, runpod_client, scene_id, stash)
 
 
-def dispatch_files(file_paths: list[str], config: dict):
+def dispatch_files(file_paths: list[str], config: dict, pipeline_kwargs: dict | None = None):
     """Dispatch files directly (no Stash lookup)."""
     runpod_client = RunPodClient(config["api_key"], config["endpoint_id"])
+    pkw = pipeline_kwargs or {}
 
     jobs = []
     for fp in file_paths:
         local_path = Path(fp)
         print(f"\n--- {local_path.name} ---")
-        job_id = dispatch_file(local_path, config, runpod_client)
+        job_id = dispatch_file(local_path, config, runpod_client, **pkw)
         if job_id:
             jobs.append((job_id, None))
 
@@ -330,7 +393,7 @@ def dispatch_files(file_paths: list[str], config: dict):
             poll_job(job_id, config, runpod_client)
 
 
-def dispatch_by_tag(tag_name: str, config: dict):
+def dispatch_by_tag(tag_name: str, config: dict, pipeline_kwargs: dict | None = None):
     """Dispatch all scenes with a given Stash tag."""
     stash = StashClient(config["stash_url"], config["stash_api_key"])
 
@@ -341,7 +404,7 @@ def dispatch_by_tag(tag_name: str, config: dict):
 
     scene_ids = [s["id"] for s in scenes]
     print(f"Found {len(scene_ids)} scene(s) with tag '{tag_name}'")
-    dispatch_scenes(scene_ids, config)
+    dispatch_scenes(scene_ids, config, pipeline_kwargs)
 
 
 def show_status(config: dict, job_id: str | None = None):
@@ -384,6 +447,39 @@ def main():
         help="Specific job ID for --status",
     )
 
+    # Pipeline feature flags
+    parser.add_argument(
+        "--output-mode", default="green_screen",
+        choices=["green_screen", "alpha_xalpha"],
+        help="Output mode (default: green_screen)",
+    )
+    parser.add_argument(
+        "--despill", action="store_true",
+        help="Enable green spill removal",
+    )
+    parser.add_argument(
+        "--despill-strength", type=float, default=0.8,
+        help="Despill strength 0-1 (default: 0.8)",
+    )
+    parser.add_argument(
+        "--refine-alpha", action="store_true",
+        help="Enable alpha refinement",
+    )
+    parser.add_argument(
+        "--alpha-sharpness", default="fine",
+        choices=["fine", "soft"],
+        help="Alpha refinement mode (default: fine)",
+    )
+    parser.add_argument(
+        "--upscale", action="store_true",
+        help="Enable Real-ESRGAN 4x upscaling",
+    )
+    parser.add_argument(
+        "--upscale-model", default="RealESRGAN_x4plus",
+        choices=["RealESRGAN_x4plus", "realesr-animevideov3"],
+        help="Upscaler model (default: RealESRGAN_x4plus)",
+    )
+
     args = parser.parse_args()
 
     if not any([args.scene, args.file, args.tag, args.status]):
@@ -392,14 +488,25 @@ def main():
 
     config = get_config()
 
+    # Build pipeline kwargs from CLI flags
+    pipeline_kwargs = {
+        "output_mode": args.output_mode,
+        "despill": args.despill,
+        "despill_strength": args.despill_strength,
+        "refine_alpha": args.refine_alpha,
+        "alpha_sharpness": args.alpha_sharpness,
+        "upscale": args.upscale,
+        "upscale_model": args.upscale_model,
+    }
+
     if args.status:
         show_status(config, args.job_id)
     elif args.scene:
-        dispatch_scenes(args.scene, config)
+        dispatch_scenes(args.scene, config, pipeline_kwargs)
     elif args.file:
-        dispatch_files(args.file, config)
+        dispatch_files(args.file, config, pipeline_kwargs)
     elif args.tag:
-        dispatch_by_tag(args.tag, config)
+        dispatch_by_tag(args.tag, config, pipeline_kwargs)
 
 
 if __name__ == "__main__":
