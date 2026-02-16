@@ -51,7 +51,6 @@ from pathlib import Path
 from typing import Optional
 
 import boto3
-import cv2
 import numpy as np
 import runpod
 import torch
@@ -1595,7 +1594,7 @@ if __name__ == "__main__":
     logger.info("CUDA available: %s", torch.cuda.is_available())
     if torch.cuda.is_available():
         logger.info("GPU: %s", torch.cuda.get_device_name(0))
-        logger.info("VRAM: %.1f GB", torch.cuda.get_device_properties(0).total_mem / 1e9)
+        logger.info("VRAM: %.1f GB", torch.cuda.get_device_properties(0).total_memory / 1e9)
 
     # Pre-load model at startup (cold start optimization)
     # Non-fatal: if this fails, model loads on first job instead
