@@ -153,7 +153,7 @@ def load_model(model_type: str = "resnet50"):
         raise FileNotFoundError(f"Model not found: {model_path}")
 
     _model = MattingNetwork(model_type).eval()
-    _model.load_state_dict(torch.load(model_path, map_location=_device, weights_only=True))
+    _model.load_state_dict(torch.load(model_path, map_location=_device, weights_only=False))
     _model = _model.to(_device)
 
     # FP16 on CUDA
