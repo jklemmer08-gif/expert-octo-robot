@@ -635,8 +635,13 @@ def build_encode_cmd(
     bitrate: str,
     extra_input_args: Optional[list] = None,
     extra_output_args: Optional[list] = None,
+    keyint: Optional[int] = None,
 ) -> list:
-    """Build FFmpeg HEVC encode command (NVENC or libx265 fallback)."""
+    """Build FFmpeg HEVC encode command (NVENC or libx265 fallback).
+
+    Args:
+        keyint: If set, forces keyframe interval for XALPHA seek sync.
+    """
     if probe_nvenc():
         encode_params = [
             "-c:v", "hevc_nvenc",
@@ -661,6 +666,10 @@ def build_encode_cmd(
             "-pix_fmt", "yuv420p",
             "-tag:v", "hvc1",
         ]
+
+    # Force keyframe interval for XALPHA seek synchronization
+    if keyint is not None:
+        encode_params.extend(["-g", str(keyint), "-keyint_min", str(keyint)])
 
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
     cmd.extend(input_args)
@@ -877,9 +886,11 @@ def process_video_streaming(
     audio_args = None
     if probe["has_audio"]:
         audio_args = ["-i", str(input_path), "-map", "0:v", "-map", "1:a", "-c:a", "copy"]
+    xalpha_keyint = 60 if output_mode == "alpha_xalpha" else None
     encode_cmd = build_encode_cmd(
         pipe_input_args, output_path, bitrate,
         extra_input_args=audio_args,
+        keyint=xalpha_keyint,
     )
 
     # --- FFmpeg alpha encode pipe (for alpha_xalpha mode) ---
@@ -902,6 +913,7 @@ def process_video_streaming(
         ]
         alpha_encode_cmd = build_encode_cmd(
             alpha_pipe_args, alpha_output_path, "2M",
+            keyint=60,
         )
         alpha_out_pin = torch.empty((alpha_h, alpha_w, 3), dtype=torch.uint8).pin_memory()
         alpha_encode_q = queue.Queue(maxsize=4)
@@ -1274,12 +1286,14 @@ def process_vr_sbs(
 
         # Merge L/R into SBS (RGB), optionally scaling to target_resolution
         logger.info("Merging L/R into SBS output")
+        sbs_keyint = 60 if output_mode == "alpha_xalpha" else None
         success = merge_sbs_videos(
             left_tmp, right_tmp, output_path,
             audio_source=input_path,
             has_audio=probe["has_audio"],
             bitrate=bitrate,
             target_resolution=target_resolution,
+            keyint=sbs_keyint,
         )
         if not success:
             return False
@@ -1292,6 +1306,7 @@ def process_vr_sbs(
                 audio_source=input_path,
                 has_audio=False,
                 bitrate="2M",
+                keyint=60,
             )
             if not success:
                 logger.error("Alpha SBS merge failed")
@@ -1330,6 +1345,7 @@ def merge_sbs_videos(
     has_audio: bool = True,
     bitrate: str = "50M",
     target_resolution: Optional[tuple] = None,
+    keyint: Optional[int] = None,
 ) -> bool:
     """Merge two matted eye videos side-by-side using FFmpeg hstack.
 
@@ -1363,6 +1379,7 @@ def merge_sbs_videos(
     cmd = build_encode_cmd(
         input_args, output_path, bitrate,
         extra_input_args=filter_args,
+        keyint=keyint,
     )
 
     logger.info("Merging L/R matted videos to SBS: %s", output_path.name)
@@ -1371,6 +1388,44 @@ def merge_sbs_videos(
         logger.error("SBS merge failed: %s", result.stderr[-500:])
         return False
     return True
+
+
+def inject_vr_metadata(video_path: Path, vr_type: str, fov: int = 180) -> bool:
+    """Inject VR stereo_mode and projection metadata tags via stream-copy remux.
+
+    HereSphere needs these tags on both main and XALPHA files for proper
+    projection and seek synchronization.
+    """
+    if vr_type not in ("sbs", "tb"):
+        return True  # 2D — nothing to inject
+
+    stereo_tag = "left_right" if vr_type == "sbs" else "top_bottom"
+    meta_tags = [
+        "-metadata:s:v:0", f"stereo_mode={stereo_tag}",
+        "-metadata:s:v:0", "projection=equirectangular",
+        "-metadata:s:v:0", f"fov_horizontal={fov}",
+        "-metadata:s:v:0", f"fov_vertical={fov}",
+    ]
+    if fov == 360:
+        meta_tags.extend(["-metadata:s:v:0", "spherical=true"])
+
+    temp_path = video_path.with_suffix(".vrmeta.mp4")
+    cmd = [
+        "ffmpeg", "-y", "-i", str(video_path),
+        "-c", "copy", *meta_tags,
+        "-movflags", "+faststart",
+        str(temp_path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, env=_ffmpeg_env())
+    if result.returncode == 0:
+        temp_path.replace(video_path)
+        logger.info("VR metadata injected: %s (stereo=%s, fov=%d)", video_path.name, stereo_tag, fov)
+        return True
+    else:
+        logger.warning("VR metadata injection failed for %s: %s", video_path.name, result.stderr[-200:])
+        if temp_path.exists():
+            temp_path.unlink()
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -1551,7 +1606,13 @@ def handler(job: dict) -> dict:
             if not rescale_video(output_path, output_path, tw, th, encode_bitrate):
                 logger.warning("Rescale failed, uploading at model resolution")
 
-        # 7. Upload result(s) to S3
+        # 9. Inject VR metadata into output files
+        if vr_type in ("sbs", "tb"):
+            inject_vr_metadata(output_path, vr_type)
+            if output_mode == "alpha_xalpha" and alpha_local_path and alpha_local_path.exists():
+                inject_vr_metadata(alpha_local_path, vr_type)
+
+        # 10. Upload result(s) to S3
         try:
             s3_upload(output_path, bucket, output_key)
         except Exception as e:
