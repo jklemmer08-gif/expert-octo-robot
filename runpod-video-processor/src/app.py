@@ -14,6 +14,7 @@ from src.config import (
     AVAILABLE_RVM_MODELS,
     DEFAULT_CRF,
     DEFAULT_DOWNSAMPLE_RATIO,
+    DEFAULT_HEVC_CRF,
     DEFAULT_MODEL,
     DEFAULT_RVM_MODEL,
     DEFAULT_SCALE,
@@ -24,7 +25,11 @@ from src.config import (
 )
 from src.gpu import detect_gpu, get_gpu_profile, get_vram_usage
 from src.pipeline.detector import VRLayout, detect_layout
-from src.pipeline.bgremover import process_video_streaming as bgremove_video
+from src.pipeline.bgremover import (
+    compute_xalpha_paths,
+    process_video_streaming as bgremove_video,
+    process_video_streaming_xalpha as bgremove_xalpha,
+)
 from src.pipeline.upscaler import process_video_streaming as upscale_video
 from src.pipeline.validator import validate_input
 from src.storage.volume import (
@@ -158,9 +163,18 @@ def api_process():
 
     if pipeline == "bgremove":
         rvm_model = data.get("rvm_model", DEFAULT_RVM_MODEL)
-        crf = int(data.get("crf", DEFAULT_VP9_CRF))
-        output_name = f"{input_name}_bgremoved.webm"
-        output_path = str(OUTPUT_DIR / output_name)
+        output_mode = data.get("output_mode", "xalpha")
+
+        if output_mode == "xalpha":
+            crf = int(data.get("crf", DEFAULT_HEVC_CRF))
+            output_path, alpha_output_path = compute_xalpha_paths(
+                input_path, layout, OUTPUT_DIR,
+            )
+        else:
+            crf = int(data.get("crf", DEFAULT_VP9_CRF))
+            output_name = f"{input_name}_bgremoved.webm"
+            output_path = str(OUTPUT_DIR / output_name)
+            alpha_output_path = None
     else:
         model_name = data.get("model", DEFAULT_MODEL)
         scale = int(data.get("scale", DEFAULT_SCALE))
@@ -180,7 +194,20 @@ def api_process():
             _current_job_id = job_id
 
         try:
-            if pipeline == "bgremove":
+            if pipeline == "bgremove" and output_mode == "xalpha":
+                result = bgremove_xalpha(
+                    input_path=input_path,
+                    output_path=output_path,
+                    alpha_output_path=alpha_output_path,
+                    model_name=rvm_model,
+                    downsample_ratio=profile.rvm_downsample_ratio,
+                    batch_size=profile.rvm_batch_size,
+                    crf=crf,
+                    layout=layout,
+                    segment_size=profile.segment_size,
+                    progress_callback=progress_callback,
+                )
+            elif pipeline == "bgremove":
                 result = bgremove_video(
                     input_path=input_path,
                     output_path=output_path,
@@ -229,6 +256,9 @@ def api_process():
     }
     if pipeline == "bgremove":
         response["rvm_model"] = rvm_model
+        response["output_mode"] = output_mode
+        if alpha_output_path:
+            response["alpha_output_path"] = alpha_output_path
     else:
         response["model"] = model_name
         response["scale"] = scale

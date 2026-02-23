@@ -11,6 +11,7 @@ from src.utils.ffmpeg import (
     build_encode_segment_cmd,
     build_encode_segment_vp9_cmd,
     build_mux_audio_cmd,
+    build_mux_audio_mp4_cmd,
     build_mux_audio_webm_cmd,
     check_nvenc_available,
     has_audio,
@@ -144,6 +145,25 @@ def encode_segment_vp9(
     )
     run_ffmpeg(cmd)
     logger.info("Encoded VP9 segment: %s", output_path)
+    return output_path
+
+
+def mux_audio_mp4(
+    video_path: str,
+    audio_source_path: str,
+    output_path: str,
+    extra_flags: Optional[List[str]] = None,
+) -> str:
+    """Mux audio from the original into MP4, transcoding to AAC."""
+    if not has_audio(audio_source_path):
+        logger.info("No audio streams found in source — skipping audio mux")
+        if video_path != output_path:
+            os.rename(video_path, output_path)
+        return output_path
+
+    cmd = build_mux_audio_mp4_cmd(video_path, audio_source_path, output_path, extra_flags)
+    run_ffmpeg(cmd)
+    logger.info("Muxed audio (AAC) from %s → %s", audio_source_path, output_path)
     return output_path
 
 

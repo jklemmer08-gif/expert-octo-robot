@@ -80,7 +80,7 @@ class TestDetectGPU:
         mock_torch.cuda.is_available.return_value = True
         mock_torch.cuda.get_device_name.return_value = "NVIDIA RTX 4090"
         mock_props = MagicMock()
-        mock_props.total_mem = 24 * (1024 ** 3)  # 24 GB
+        mock_props.total_memory = 24 * (1024 ** 3)  # 24 GB
         mock_torch.cuda.get_device_properties.return_value = mock_props
         mock_torch.cuda.device_count.return_value = 1
         with patch.dict("sys.modules", {"torch": mock_torch}):
@@ -104,7 +104,7 @@ class TestGetGPUProfile:
         mock_torch.cuda.is_available.return_value = True
         mock_torch.cuda.get_device_name.return_value = "NVIDIA A100-SXM4-80GB"
         mock_props = MagicMock()
-        mock_props.total_mem = 80 * (1024 ** 3)
+        mock_props.total_memory = 80 * (1024 ** 3)
         mock_torch.cuda.get_device_properties.return_value = mock_props
         mock_torch.cuda.device_count.return_value = 1
         with patch.dict("sys.modules", {"torch": mock_torch}):
@@ -127,7 +127,7 @@ class TestGetVRAMUsage:
         mock_torch = MagicMock()
         mock_torch.cuda.is_available.return_value = True
         mock_props = MagicMock()
-        mock_props.total_mem = 24 * (1024 ** 3)
+        mock_props.total_memory = 24 * (1024 ** 3)
         mock_torch.cuda.get_device_properties.return_value = mock_props
         mock_torch.cuda.memory_reserved.return_value = 4 * (1024 ** 3)
         mock_torch.cuda.memory_allocated.return_value = 2 * (1024 ** 3)

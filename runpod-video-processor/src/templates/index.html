@@ -164,8 +164,16 @@
                                 </select>
                             </div>
                             <div>
-                                <label class="block text-xs text-slate-400 mb-1">VP9 CRF (20=high quality, 40=small file)</label>
-                                <input type="number" id="cfg-crf-bgremove" value="30" min="20" max="50" class="w-full rounded px-3 py-2 text-sm">
+                                <label class="block text-xs text-slate-400 mb-1">Output Mode</label>
+                                <select id="cfg-bg-output-mode" class="w-full rounded px-3 py-2 text-sm">
+                                    <option value="xalpha">HereSphere XALPHA (Quest 3 passthrough)</option>
+                                    <option value="vp9_alpha">VP9 WebM (native alpha)</option>
+                                </select>
+                                <p class="text-xs text-slate-500 mt-1">XALPHA: HEVC main + 480p alpha companion for HereSphere v0.12+</p>
+                            </div>
+                            <div>
+                                <label class="block text-xs text-slate-400 mb-1">CRF (lower=higher quality)</label>
+                                <input type="number" id="cfg-crf-bgremove" value="20" min="10" max="50" class="w-full rounded px-3 py-2 text-sm">
                             </div>
                         </div>
                     </div>
@@ -355,6 +363,7 @@
         if (pipeline === 'bgremove') {
             body.rvm_model = document.getElementById('cfg-rvm-model').value;
             body.crf = parseInt(document.getElementById('cfg-crf-bgremove').value);
+            body.output_mode = document.getElementById('cfg-bg-output-mode').value;
         } else {
             body.model = document.getElementById('cfg-model').value;
             body.scale = parseInt(document.getElementById('cfg-scale').value);

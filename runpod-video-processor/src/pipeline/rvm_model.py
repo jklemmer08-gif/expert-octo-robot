@@ -67,6 +67,23 @@ class RVMProcessor:
         rgba = torch.cat([fgr * pha, pha], dim=1).clamp(0, 1)
         return rgba
 
+    def process_batch_split(self, batch_rgb: "torch.Tensor"):
+        """Process a batch and return (fgr, pha) separately.
+
+        Args:
+            batch_rgb: (B, 3, H, W) float32 tensor in [0, 1] on GPU.
+
+        Returns:
+            Tuple of (fgr, pha) where:
+              fgr: (B, 3, H, W) float32 foreground in [0, 1]
+              pha: (B, 1, H, W) float32 alpha in [0, 1]
+        """
+        with torch.no_grad():
+            fgr, pha, *self.rec = self.model(
+                batch_rgb, *self.rec, self.downsample_ratio
+            )
+        return fgr.clamp(0, 1), pha.clamp(0, 1)
+
     def reset(self):
         """Reset recurrent states (call between unrelated videos)."""
         self.rec = [None] * 4

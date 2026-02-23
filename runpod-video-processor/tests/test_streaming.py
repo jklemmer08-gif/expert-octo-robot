@@ -10,6 +10,17 @@ import numpy as np
 from unittest.mock import patch, MagicMock, call
 
 from src.utils.streaming import read_frame, read_frames, write_frame, close_process
+
+
+def _make_readable_pipe(data_chunks):
+    """Create a mock process whose stdout behaves like a real binary pipe.
+
+    data_chunks: list of bytes objects to return sequentially via readinto().
+    """
+    stream = io.BytesIO(b"".join(data_chunks))
+    mock_proc = MagicMock()
+    mock_proc.stdout = stream
+    return mock_proc
 from src.utils.ffmpeg import (
     build_decode_pipe_cmd,
     build_encode_pipe_cmd,
@@ -89,24 +100,19 @@ class TestReadFrame:
         width, height, channels = 4, 3, 3
         frame_data = np.arange(width * height * channels, dtype=np.uint8).tobytes()
 
-        mock_proc = MagicMock()
-        mock_proc.stdout.read.return_value = frame_data
-
+        mock_proc = _make_readable_pipe([frame_data])
         result = read_frame(mock_proc, width, height, channels)
 
         assert result is not None
         assert result.shape == (height, width, channels)
         assert result.dtype == np.uint8
-        mock_proc.stdout.read.assert_called_once_with(width * height * channels)
 
     def test_read_bgra_frame(self):
         """Read a 4-channel BGRA frame."""
         width, height, channels = 4, 3, 4
         frame_data = np.zeros(width * height * channels, dtype=np.uint8).tobytes()
 
-        mock_proc = MagicMock()
-        mock_proc.stdout.read.return_value = frame_data
-
+        mock_proc = _make_readable_pipe([frame_data])
         result = read_frame(mock_proc, width, height, channels)
 
         assert result is not None
@@ -114,17 +120,13 @@ class TestReadFrame:
 
     def test_read_frame_end_of_stream(self):
         """Return None when pipe has no more data."""
-        mock_proc = MagicMock()
-        mock_proc.stdout.read.return_value = b""
-
+        mock_proc = _make_readable_pipe([b""])
         result = read_frame(mock_proc, 4, 3, 3)
         assert result is None
 
     def test_read_frame_partial_data(self):
         """Return None on incomplete frame (truncated stream)."""
-        mock_proc = MagicMock()
-        mock_proc.stdout.read.return_value = b"\x00" * 10  # too short
-
+        mock_proc = _make_readable_pipe([b"\x00" * 10])
         result = read_frame(mock_proc, 100, 100, 3)
         assert result is None
 
@@ -137,9 +139,7 @@ class TestReadFrames:
         nbytes = width * height * channels
         frame_data = np.zeros(nbytes, dtype=np.uint8).tobytes()
 
-        mock_proc = MagicMock()
-        mock_proc.stdout.read.side_effect = [frame_data, frame_data, frame_data]
-
+        mock_proc = _make_readable_pipe([frame_data] * 3)
         result = read_frames(mock_proc, width, height, 3, channels)
         assert len(result) == 3
 
@@ -148,9 +148,7 @@ class TestReadFrames:
         nbytes = width * height * channels
         frame_data = np.zeros(nbytes, dtype=np.uint8).tobytes()
 
-        mock_proc = MagicMock()
-        mock_proc.stdout.read.side_effect = [frame_data, b""]
-
+        mock_proc = _make_readable_pipe([frame_data])
         result = read_frames(mock_proc, width, height, 5, channels)
         assert len(result) == 1
 
@@ -243,12 +241,11 @@ class TestUpscalerStreaming:
         upscaled_frame = np.zeros((256, 256, 3), dtype=np.uint8)
         mock_upsampler.enhance.return_value = (upscaled_frame, None)
 
-        # Mock decode pipe returning 3 frames then None
-        frame_data = np.zeros((64, 64, 3), dtype=np.uint8)
-        frame_bytes = frame_data.tobytes()
+        # Mock decode pipe returning 3 frames via BytesIO
+        frame_bytes = np.zeros((64, 64, 3), dtype=np.uint8).tobytes()
 
         mock_decode_proc = MagicMock()
-        mock_decode_proc.stdout.read.side_effect = [frame_bytes, frame_bytes, frame_bytes, b""]
+        mock_decode_proc.stdout = io.BytesIO(frame_bytes * 3)
         mock_decode_proc.returncode = 0
         mock_decode_proc.stdin = None
         mock_decode_proc.stderr = None
@@ -327,10 +324,10 @@ class TestUpscalerStreaming:
         upscaled_eye = np.zeros((128, 128, 3), dtype=np.uint8)
         mock_upsampler.enhance.return_value = (upscaled_eye, None)
 
-        frame_data = np.zeros((64, 128, 3), dtype=np.uint8).tobytes()
+        frame_bytes = np.zeros((64, 128, 3), dtype=np.uint8).tobytes()
 
         mock_decode_proc = MagicMock()
-        mock_decode_proc.stdout.read.side_effect = [frame_data, b""]
+        mock_decode_proc.stdout = io.BytesIO(frame_bytes)
         mock_decode_proc.returncode = 0
         mock_decode_proc.stdin = None
         mock_decode_proc.stderr = None
@@ -396,11 +393,11 @@ class TestBgRemoverStreaming:
         mock_proc.get_recurrent_states.return_value = [None] * 4
         mock_proc.process_batch.return_value = MagicMock()
 
-        # Mock decode pipe returning 2 frames
-        frame_data = np.zeros((64, 64, 3), dtype=np.uint8).tobytes()
+        # Mock decode pipe returning 2 frames via BytesIO
+        frame_bytes = np.zeros((64, 64, 3), dtype=np.uint8).tobytes()
 
         mock_decode_proc = MagicMock()
-        mock_decode_proc.stdout.read.side_effect = [frame_data, frame_data, b""]
+        mock_decode_proc.stdout = io.BytesIO(frame_bytes * 2)
         mock_decode_proc.returncode = 0
         mock_decode_proc.stdin = None
         mock_decode_proc.stderr = None

@@ -34,6 +34,12 @@ DEFAULT_RVM_BATCH_SIZE = int(os.getenv("DEFAULT_RVM_BATCH_SIZE", "8"))
 RVM_MODEL_DIR = Path(os.getenv("RVM_MODEL_DIR", "/app/models/rvm"))
 DEFAULT_VP9_CRF = int(os.getenv("DEFAULT_VP9_CRF", "30"))
 
+# --- XALPHA Output (HereSphere External Alpha) ---
+DEFAULT_HEVC_CRF = int(os.getenv("DEFAULT_HEVC_CRF", "20"))
+XALPHA_HEIGHT = int(os.getenv("XALPHA_HEIGHT", "480"))
+XALPHA_CRF = int(os.getenv("XALPHA_CRF", "23"))
+XALPHA_KEYINT = int(os.getenv("XALPHA_KEYINT", "60"))
+
 AVAILABLE_RVM_MODELS = {
     "resnet50": {
         "file": "rvm_resnet50_fp32.torchscript",

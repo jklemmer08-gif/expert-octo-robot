@@ -102,6 +102,28 @@ def check_nvenc_available() -> bool:
         return False
 
 
+def check_nvenc_encode_works() -> bool:
+    """Test that NVENC can actually encode by writing a small test frame.
+
+    Some GPUs list hevc_nvenc but fail at init (e.g. missing driver support).
+    """
+    try:
+        cmd = [
+            "ffmpeg", "-nostdin", "-y",
+            "-f", "rawvideo", "-pix_fmt", "bgr24",
+            "-s", "64x64", "-r", "1", "-i", "pipe:0",
+            "-frames:v", "1", "-c:v", "hevc_nvenc",
+            "-f", "null", "-",
+        ]
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+        proc.stdin.write(b"\x00" * (64 * 64 * 3))
+        proc.stdin.close()
+        proc.wait(timeout=10)
+        return proc.returncode == 0
+    except Exception:
+        return False
+
+
 def build_extract_frames_cmd(
     input_path: str,
     output_pattern: str,
@@ -299,6 +321,70 @@ def build_encode_pipe_cmd(
         cmd.extend(["-preset", preset, "-crf", str(crf)])
 
     cmd.extend(["-pix_fmt", "yuv420p", "-v", "error", output_path])
+    return cmd
+
+
+def build_encode_pipe_hevc_cmd(
+    fps: float,
+    width: int,
+    height: int,
+    crf: int,
+    output_path: str,
+    keyint: int = 60,
+    codec: str = "hevc_nvenc",
+    preset: str = "slow",
+) -> List[str]:
+    """Build ffmpeg command to encode raw BGR24 from stdin to HEVC MP4.
+
+    Forces keyframe interval for seek synchronization with XALPHA companion.
+    """
+    cmd = [
+        "ffmpeg", "-nostdin", "-y",
+        "-f", "rawvideo",
+        "-pix_fmt", "bgr24",
+        "-s", f"{width}x{height}",
+        "-r", str(fps),
+        "-i", "pipe:0",
+        "-c:v", codec,
+    ]
+
+    if codec == "hevc_nvenc":
+        cmd.extend(["-preset", "p7", "-rc", "vbr", "-cq", str(crf)])
+    else:
+        cmd.extend(["-preset", preset, "-crf", str(crf)])
+
+    cmd.extend([
+        "-g", str(keyint),
+        "-keyint_min", str(keyint),
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        "-v", "error",
+        output_path,
+    ])
+    return cmd
+
+
+def build_mux_audio_mp4_cmd(
+    video_path: str,
+    audio_source_path: str,
+    output_path: str,
+    extra_flags: Optional[List[str]] = None,
+) -> List[str]:
+    """Mux audio from the original file into MP4, transcoding to AAC."""
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", video_path,
+        "-i", audio_source_path,
+        "-map", "0:v",
+        "-map", "1:a",
+        "-c:v", "copy",
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-movflags", "+faststart",
+    ]
+    if extra_flags:
+        cmd.extend(extra_flags)
+    cmd.append(output_path)
     return cmd
 
 
