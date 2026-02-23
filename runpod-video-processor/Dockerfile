@@ -1,6 +1,6 @@
 # RunPod Video Processor — GPU-Accelerated Upscaling
-# Base: RunPod PyTorch with CUDA 12.8 (supports Blackwell sm_120 GPUs)
-FROM runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04
+# Base: RunPod PyTorch with CUDA 12.1 (broad driver compat, RTX 30xx/40xx/A-series)
+FROM runpod/pytorch:2.2.0-py3.10-cuda12.1.1-devel-ubuntu22.04
 
 LABEL maintainer="runpod-video-processor"
 LABEL description="GPU-accelerated video upscaling with Real-ESRGAN"
@@ -34,7 +34,7 @@ WORKDIR /app
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir --ignore-installed blinker && \
     pip install --no-cache-dir -r requirements.txt \
-    --extra-index-url https://download.pytorch.org/whl/cu128 && \
+    --extra-index-url https://download.pytorch.org/whl/cu121 && \
     # Fix basicsr compatibility with torchvision >= 0.17 \
     # (functional_tensor was removed, use functional instead) \
     BASICSR_DIR=$(pip show basicsr | grep "^Location:" | cut -d' ' -f2)/basicsr && \
